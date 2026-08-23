@@ -1,0 +1,9 @@
+.git
+.venv
+.uv-cache
+var
+web/node_modules
+web/dist
+tests
+__pycache__
+*.xlsx

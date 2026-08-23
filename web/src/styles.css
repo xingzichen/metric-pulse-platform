@@ -1,0 +1,154 @@
+:root {
+  font-family: Inter, "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: #172033;
+  background: #f5f7fb;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+}
+.shell {
+  min-height: 100vh;
+}
+.sidebar {
+  background: #111b35;
+  color: white;
+  display: flex;
+  flex-direction: column;
+}
+.brand {
+  padding: 24px 20px;
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+.brand small {
+  display: block;
+  color: #93a3c7;
+  margin-top: 3px;
+}
+.logo {
+  background: #3972ef;
+  padding: 10px 8px;
+  border-radius: 10px;
+  font-weight: 800;
+}
+.sidebar .el-menu {
+  border: 0;
+  background: transparent;
+  flex: 1;
+}
+.sidebar .el-menu-item {
+  color: #afbddb;
+  margin: 3px 10px;
+  border-radius: 8px;
+}
+.sidebar .el-menu-item:hover,
+.sidebar .el-menu-item.is-active {
+  background: #213258;
+  color: #fff;
+}
+.account {
+  padding: 14px 20px;
+  border-top: 1px solid #273655;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.el-header {
+  background: white;
+  border-bottom: 1px solid #e7eaf1;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+.el-main {
+  padding: 28px;
+  max-width: 1500px;
+  width: 100%;
+  margin: auto;
+}
+.page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 22px;
+}
+.page-head h1 {
+  margin: 0;
+  font-size: 26px;
+}
+.muted {
+  color: #778197;
+}
+.card {
+  border: 0 !important;
+  box-shadow: 0 2px 14px rgba(21, 39, 75, 0.06) !important;
+}
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+  margin-bottom: 20px;
+}
+.stat {
+  background: white;
+  padding: 20px;
+  border-radius: 12px;
+}
+.stat b {
+  display: block;
+  font-size: 30px;
+  margin-top: 8px;
+}
+.progress-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.w-full {
+  width: 100%;
+}
+.actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(360px, 0.8fr);
+  gap: 18px;
+}
+.json-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.json-table td {
+  padding: 8px;
+  border-bottom: 1px solid #edf0f5;
+  vertical-align: top;
+}
+.json-table td:first-child {
+  color: #68728a;
+  width: 36%;
+}
+@media (max-width: 900px) {
+  .stat-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .split {
+    grid-template-columns: 1fr;
+  }
+  .sidebar {
+    width: 76px !important;
+  }
+  .brand > div:last-child,
+  .sidebar .el-menu-item {
+    font-size: 0;
+  }
+  .account {
+    display: none;
+  }
+}

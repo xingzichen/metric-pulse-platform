@@ -1,0 +1,93 @@
+name: metric-pulse
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: metric_pulse
+      POSTGRES_USER: metric_pulse
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U metric_pulse -d metric_pulse"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: &app-env
+      MP_ENV: production
+      MP_DATABASE_URL: postgresql+psycopg://metric_pulse:${POSTGRES_PASSWORD}@postgres:5432/metric_pulse
+      MP_OBJECT_ROOT: /data/objects
+      MP_EXPORT_ROOT: /data/exports
+      MP_CELERY_BROKER_URL: redis://redis:6379/0
+      MP_CELERY_RESULT_BACKEND: redis://redis:6379/1
+      MP_EAGER_TASKS: "false"
+      MP_SESSION_COOKIE_SECURE: ${MP_SESSION_COOKIE_SECURE:-false}
+      MP_BOOTSTRAP_USERNAME: ${MP_BOOTSTRAP_USERNAME:-admin}
+      MP_BOOTSTRAP_PASSWORD: ${MP_BOOTSTRAP_PASSWORD:?set MP_BOOTSTRAP_PASSWORD}
+      MP_OMLX_BASE_URL: ${MP_OMLX_BASE_URL:-http://10.0.0.203:5008/v1}
+      MP_OMLX_MODEL: ${MP_OMLX_MODEL:-Qwen3.8-27B-6bit}
+      MP_OMLX_API_KEY: ${MP_OMLX_API_KEY:-}
+      MP_OMLX_MAX_OUTPUT_TOKENS: ${MP_OMLX_MAX_OUTPUT_TOKENS:-2048}
+      MP_VISION_ANALYSIS_ENABLED: ${MP_VISION_ANALYSIS_ENABLED:-true}
+      MP_COLLECTOR_MODE: omlx
+    volumes: &app-volumes
+      - object-data:/data/objects
+      - export-data:/data/exports
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  api:
+    build: .
+    restart: unless-stopped
+    environment: *app-env
+    volumes: *app-volumes
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready')"]
+      interval: 20s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    build: .
+    command: ["metric-pulse-worker"]
+    restart: unless-stopped
+    environment: *app-env
+    volumes: *app-volumes
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+
+  web:
+    build: ./web
+    restart: unless-stopped
+    ports:
+      - "${MP_WEB_PORT:-8080}:80"
+    depends_on:
+      api: { condition: service_healthy }
+
+volumes:
+  postgres-data:
+  redis-data:
+  object-data:
+  export-data:

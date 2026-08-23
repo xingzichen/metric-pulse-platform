@@ -1,0 +1,1057 @@
+# metric-pulse-platform 应用设计
+
+## 1. 文档信息
+
+| 项目 | 内容 |
+| --- | --- |
+| 文档版本 | v1.1 |
+| 状态 | 应用设计基线草案 |
+| 更新日期 | 2026-08-23 |
+| 覆盖范围 | Python 后端应用、Web 前端、API、主要用例和交互 |
+
+## 2. 应用目标
+
+应用必须让普通用户以尽量少的操作完成：
+
+1. 上传工作簿；
+2. 确认自动识别的采集方案；
+3. 启动并控制任务；
+4. 主要核对异常和低置信度结果；
+5. 快速确认高质量结果；
+6. 在全部纳入导出的数据审核完成后下载正式工作簿。
+
+应用不得要求用户理解队列、worker、模型 prompt、数据库表或复杂状态机。
+
+## 3. 信息架构
+
+```text
+登录
+└── 工作台
+    ├── 任务
+    │   ├── 任务列表
+    │   ├── 新建任务向导
+    │   └── 任务详情
+    │       ├── 概览
+    │       ├── 数据集/工作表
+    │       ├── 失败与异常
+    │       ├── 运行事件
+    │       ├── 核对工作台
+    │       └── 导出
+    ├── 模板
+    │   ├── 模板列表
+    │   ├── 模板详情
+    │   └── 模板版本
+    ├── 文件
+    │   ├── 文件列表
+    │   └── 文件预览
+    └── 管理
+        ├── 用户与角色
+        ├── 模型与来源
+        ├── worker 与队列
+        ├── 存储与保留
+        └── 审计日志
+```
+
+## 4. 页面路由
+
+| 路由 | 页面 | 权限 |
+| --- | --- | --- |
+| `/login` | 登录 | 匿名 |
+| `/` | 工作台首页 | 登录用户 |
+| `/tasks` | 任务列表 | VIEWER+ |
+| `/tasks/new` | 新建任务向导 | OPERATOR+ |
+| `/tasks/:taskId` | 任务详情 | VIEWER+ |
+| `/tasks/:taskId/review` | 核对工作台 | REVIEWER+ |
+| `/tasks/:taskId/exports` | 导出记录 | VIEWER+，创建需 OPERATOR+ |
+| `/files` | 文件列表 | VIEWER+ |
+| `/files/:fileId` | 文件与分析结果 | VIEWER+ |
+| `/templates` | 模板列表 | VIEWER+ |
+| `/templates/:templateId` | 模板详情 | VIEWER+，编辑需 ADMIN |
+| `/admin/users` | 用户管理 | ADMIN |
+| `/admin/system` | 系统状态 | ADMIN |
+| `/admin/audit` | 审计日志 | ADMIN |
+
+## 5. 前端技术设计
+
+### 5.1 技术栈
+
+- Vue 3 + TypeScript，统一使用 Composition API 和 `<script setup>`；
+- Vite；
+- Vue Router 5 内置自动文件路由；
+- Element Plus；
+- TanStack Query for Vue；
+- Pinia，仅管理客户端会话和 UI 状态；
+- Element Plus Table 配合服务端分页；核对长队列使用 TanStack Virtual；
+- OpenAPI 生成 Client；
+- Valibot 只用于前端独有表单和 URL 参数，不重复定义服务端 DTO；
+- Vitest + Vue Test Utils 组件测试，Playwright 端到端测试。
+
+Element Plus 用于稳定的业务组件和视觉一致性。审核工作台需要长列表和精细键盘交互，因此不把 Element Plus 仍处于 beta 的 Virtualized Table 作为核心基础。
+
+### 5.2 状态分类
+
+服务端状态：
+
+- 任务、文件、模板、审核、导出和事件；
+- 使用 TanStack Query 管理；
+- mutation 完成后精确失效相关 query；
+- SSE 事件用于触发局部缓存更新。
+
+客户端状态：
+
+- 当前筛选器；
+- 核对页面布局；
+- 尚未提交的字段编辑；
+- 键盘快捷键和用户偏好。
+
+不把任务完整副本长期放入 Pinia，避免与服务端状态分叉。
+
+### 5.3 API Client
+
+- CI 从后端 OpenAPI 生成 TypeScript Client；
+- 生成代码进入独立目录，不手工修改；
+- Client 统一注入 `requestId`、CSRF、错误转换和版本 header；
+- 业务组件只通过应用层 composables 调用 Client。
+
+### 5.4 自动文件路由
+
+`src/pages` 是页面路由的唯一结构化来源，不手写与文件重复的巨型路由表。Vue Router 5 的 Vite 插件在构建时生成路由记录、路由名称和参数类型。
+
+计划文件结构：
+
+```text
+apps/web/src/
+├── pages/
+│   ├── index.vue
+│   ├── login.vue
+│   ├── tasks/
+│   │   ├── index.vue
+│   │   ├── new.vue
+│   │   └── [taskId]/
+│   │       ├── index.vue
+│   │       ├── review.vue
+│   │       └── exports.vue
+│   ├── files/
+│   │   ├── index.vue
+│   │   └── [fileId].vue
+│   ├── templates/
+│   │   ├── index.vue
+│   │   └── [templateId].vue
+│   ├── admin/
+│   │   ├── users.vue
+│   │   ├── system.vue
+│   │   └── audit.vue
+│   └── [...path].vue
+├── layouts/
+│   ├── AppLayout.vue
+│   └── PublicLayout.vue
+├── router/
+│   ├── index.ts
+│   ├── guards.ts
+│   └── route-meta.d.ts
+└── generated/
+    └── api/                 # OpenAPI 生成，不手工修改
+```
+
+每个页面通过 `definePage` 声明 `title`、`layout`、`requiresAuth`、`roles` 和面包屑元数据。全局守卫只负责会话恢复、鉴权和授权；页面组件仍必须根据 API 返回的 `allowedActions` 隐藏或禁用动作，后端继续执行最终权限检查。
+
+布局由路由元数据映射到 `AppLayout` 或 `PublicLayout`，不再引入另一个布局路由插件。页面数据加载使用 TanStack Query for Vue；不使用 Vue Router 的实验性 Data Loaders，避免关键数据流程依赖实验 API。
+
+## 6. 后端代码组织
+
+```text
+packages/
+├── domain/
+│   ├── identity/
+│   ├── files/
+│   ├── templates/
+│   ├── tasks/
+│   ├── workbook/
+│   ├── collection/
+│   ├── evidence/
+│   ├── review/
+│   └── export/
+├── application/
+│   ├── commands/
+│   ├── queries/
+│   ├── handlers/
+│   ├── dto/
+│   └── ports/
+├── infrastructure/
+│   ├── db/
+│   ├── queue/
+│   ├── object_store/
+│   ├── http/
+│   ├── auth/
+│   └── observability/
+├── workbook/
+│   ├── parser/
+│   ├── profiles/
+│   ├── planner/
+│   ├── builder/
+│   └── validator/
+└── collection/
+    ├── source_adapters/
+    ├── content_extractors/
+    ├── prompting/
+    ├── normalization/
+    ├── validation/
+    └── scoring/
+```
+
+### 6.1 Domain
+
+包含：
+
+- 实体和值对象；
+- 状态机；
+- 领域规则；
+- 领域事件；
+- repository 接口。
+
+Domain 不依赖 FastAPI、Celery、SQLAlchemy、Redis 和 S3。
+
+### 6.2 Application
+
+一个 handler 对应一个明确用例，例如：
+
+- `CreateTask`；
+- `StartTask`；
+- `PauseTask`；
+- `SubmitReview`；
+- `CreateExport`。
+
+handler 负责：
+
+1. 加载聚合；
+2. 执行权限和前置条件；
+3. 调用领域行为；
+4. 通过 repository 保存；
+5. 在同一事务写 outbox；
+6. 返回应用 DTO。
+
+### 6.3 Infrastructure
+
+- SQLAlchemy repository；
+- Redis/Celery adapter；
+- S3 adapter；
+- HTTPX adapter；
+- OMLX adapter；
+- password/session adapter；
+- 日志和 tracing。
+
+### 6.4 API
+
+FastAPI route 只负责：
+
+- 解析请求；
+- 注入用户和 application handler；
+- 转换应用异常；
+- 设置 HTTP status/header；
+- 返回 response model。
+
+route 不直接执行 ORM query 或修改状态。
+
+## 7. API 通用设计
+
+### 7.1 响应
+
+单资源：
+
+```json
+{
+  "data": {
+    "id": "0194...",
+    "version": 3
+  },
+  "meta": {
+    "requestId": "req_..."
+  }
+}
+```
+
+分页：
+
+```json
+{
+  "data": [],
+  "page": {
+    "cursor": null,
+    "nextCursor": "...",
+    "hasMore": false,
+    "total": 275
+  },
+  "meta": {
+    "requestId": "req_..."
+  }
+}
+```
+
+错误：
+
+```json
+{
+  "error": {
+    "code": "TASK_STATE_CONFLICT",
+    "message": "任务当前状态不允许暂停",
+    "details": {
+      "currentStatus": "PAUSED",
+      "allowedActions": ["resume", "stop", "delete"]
+    }
+  },
+  "meta": {
+    "requestId": "req_..."
+  }
+}
+```
+
+### 7.2 分页
+
+- 大列表使用 cursor pagination；
+- 小型管理列表可以使用 page/size；
+- 服务端强制最大 page size；
+- 每个列表有稳定排序，默认 `createdAt desc, id desc`；
+- 不使用没有排序的分页查询。
+
+### 7.3 并发控制
+
+更新请求携带：
+
+```http
+If-Match: "3"
+Idempotency-Key: 0194...
+```
+
+版本冲突返回 `409` 和当前版本摘要。
+
+### 7.4 日期、数字和 ID
+
+- 时间使用 ISO 8601 UTC，前端按用户时区显示；
+- 金额和高精度数值以字符串返回，避免 JavaScript 浮点损失；
+- 主键使用 UUIDv7/ULID 风格可排序 ID；
+- 枚举值使用稳定英文 code，界面通过字典显示中文。
+
+## 8. 文件与任务创建 API
+
+### 8.1 文件上传
+
+```text
+POST /api/v1/files
+GET  /api/v1/files/:fileId
+GET  /api/v1/files/:fileId/analysis
+GET  /api/v1/files/:fileId/download
+```
+
+`POST /files` 使用 multipart 流式上传：
+
+- 服务端边读边计算 hash；
+- 临时对象完成后原子转正；
+- 返回文件 ID 和 `ANALYZING` 状态；
+- 工作簿分析进入 worker。
+
+### 8.2 新建任务
+
+```text
+POST /api/v1/tasks
+```
+
+请求：
+
+```json
+{
+  "fileVersionId": "...",
+  "taskName": "2026-08 人工智能数据采集",
+  "templateVersionId": "...",
+  "datasetSelections": [
+    {
+      "datasetId": "ai_index",
+      "mode": "row_contract_collect",
+      "enabled": true
+    }
+  ],
+  "modelAlias": "omlx-default",
+  "startImmediately": true
+}
+```
+
+服务端必须重新校验文件分析、模板版本和 mode 兼容性，不能信任前端预览结果。
+
+## 9. 新建任务向导
+
+### 9.1 第一步：上传
+
+- 拖放或选择 `.xlsx`；
+- 显示上传进度；
+- 显示文件安全和格式检查；
+- 相同 hash 文件提示复用或继续新建版本。
+
+### 9.2 第二步：分析预览
+
+展示：
+
+- 工作表列表和行数；
+- 表头识别；
+- 已匹配模板；
+- 识别置信度；
+- 已有行/近空表判断；
+- 业务键和重复数；
+- 目标组数量；
+- 严重异常。
+
+每个工作表同时展示：
+
+- 工作表渲染缩略图，可点击定位到表头、数据区和目标字段；
+- OOXML 结构解析结果与多模态模型识别结果；
+- 模板、结构规则和模型候选的一致/冲突标记；
+- 识别来源、联合置信区间和需要确认的具体原因；
+- 字段映射修正、区域调整和“保存为模板版本”操作。
+
+用户只处理 `NEEDS_CONFIRMATION` 项。
+
+页面不展示模型隐藏推理，只展示字段坐标、结构校验、模板差异和可审计的简短理由。
+
+### 9.3 第三步：确认方案
+
+每个数据集显示推荐 mode：
+
+- `row_contract_collect`；
+- `row_contract_refresh`；
+- `snapshot_build`；
+- `snapshot_reconcile`；
+- `entity_refresh`；
+- `preserve`；
+- `structured_import`。
+
+普通用户只需启用/禁用和接受推荐。高级配置折叠展示。
+
+### 9.4 第四步：启动
+
+- 任务名称；
+- 预计记录和目标组数量；
+- 模型和来源策略摘要；
+- 风险和未确认项；
+- “创建后立即启动”。
+
+存在阻断异常时不能启动。
+
+## 10. 任务列表
+
+### 10.1 列
+
+- 任务名称；
+- 原文件；
+- 创建人；
+- 执行状态；
+- 审核状态；
+- 导出状态；
+- 行进度和目标组进度；
+- 成功/失败；
+- 创建时间；
+- 最近更新时间；
+- 操作。
+
+### 10.2 筛选
+
+- 任务名；
+- 文件名；
+- 状态；
+- 模板；
+- 创建人；
+- 时间范围；
+- “只看需要我处理”；
+- “只看有错误”。
+
+### 10.3 操作
+
+操作按钮完全依据后端 `allowedActions`：
+
+- start；
+- pause；
+- resume；
+- stop；
+- retry；
+- delete；
+- review；
+- export。
+
+危险操作使用明确确认，不使用仅“确定/取消”的模糊提示。
+
+## 11. 任务详情
+
+### 11.1 概览卡片
+
+- 执行、审核和导出三种状态；
+- 行数和目标组数；
+- pending/running/succeeded/failed；
+- approved/corrected/rejected/skipped；
+- 当前运行时长和最近心跳；
+- OMLX 和来源异常提示。
+
+### 11.2 数据集视图
+
+每个数据集展示：
+
+- mode；
+- 输入行、枚举行和最终记录数；
+- INSERT/UPDATE/KEEP/RETIRE/CONFLICT；
+- 采集和审核进度；
+- 失败分类；
+- 进入过滤后的审核工作台。
+
+### 11.3 事件时间线
+
+事件只展示用户可以理解的信息：
+
+- 启动、暂停、恢复和停止；
+- 数据集开始和完成；
+- 连续错误；
+- worker 恢复；
+- 审核完成；
+- 导出生成。
+
+底层 attempt 日志进入技术详情，不淹没用户时间线。
+
+## 12. 任务控制用例
+
+### 12.1 启动
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant W as Web
+    participant A as API
+    participant D as PostgreSQL
+    participant O as Outbox Dispatcher
+    participant Q as Celery
+
+    U->>W: 点击启动
+    W->>A: POST /tasks/:id/start + If-Match
+    A->>D: 原子 DRAFT/PAUSED → QUEUED
+    A->>D: 创建 task_run/outbox
+    A-->>W: 202 + 当前状态 + allowedActions
+    O->>D: 读取 outbox
+    O->>Q: 发布规划任务
+```
+
+### 12.2 暂停
+
+- API 将状态改为 `PAUSING`；
+- 页面立即显示“正在暂停”；
+- 解释“当前正在处理的少量数据可能会完成”；
+- SSE 收到 `PAUSED` 后按钮变为恢复。
+
+### 12.3 停止
+
+确认框说明：
+
+- 停止后不能恢复当前运行；
+- 已完成结果和证据保留；
+- 可以基于同一配置创建新的运行；
+- 在途结果可能被丢弃。
+
+### 12.4 删除
+
+- 运行中任务不显示删除；
+- 只做软删除；
+- 默认可在回收站恢复；
+- 原文件被其他任务引用时不删除对象。
+
+## 13. 核对工作台
+
+### 13.1 页面布局
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│ 任务 / 工作表 / 筛选 / 审核统计 / 快捷键说明                  │
+├───────────────┬────────────────────────┬─────────────────────┤
+│ 行队列         │ 原始行 ↔ 建议/最终值     │ 证据与处理过程        │
+│               │                        │                     │
+│ 异常标识       │ 字段差异               │ 候选值                │
+│ 置信度         │ 类型和单位校验          │ 原文命中片段           │
+│ 审核状态       │ 编辑控件               │ 来源定位/转换过程       │
+│               │                        │ attempt 历史          │
+├───────────────┴────────────────────────┴─────────────────────┤
+│ 批准 / 修正后批准 / 驳回重采 / 跳过 / 保存并下一条            │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 13.2 行队列
+
+默认排序：
+
+1. 失败；
+2. 来源冲突；
+3. 低置信度；
+4. 类型/单位异常；
+5. 证据不足；
+6. 高置信度普通项。
+
+支持按：
+
+- 工作表；
+- dataset；
+- collection status；
+- review status；
+- field group；
+- confidence band；
+- error category；
+- source domain；
+- business key；
+- 只看被分配给我。
+
+### 13.3 中间对照区
+
+- 顶部显示工作表、原始行号和业务键；
+- 原始值只读；
+- 建议值与原始值差异高亮；
+- 最终值使用类型化控件；
+- 字段说明、单位和空值语义随时可见；
+- 目标组中的相关字段并排显示；
+- 修改任一字段时对整个结果组重新执行前端快速校验；
+- 服务端保存时执行完整校验。
+
+### 13.4 证据区
+
+标签页：
+
+- 当前候选；
+- 其他候选；
+- 原文证据；
+- 转换/校验；
+- 处理历史；
+- 审核历史。
+
+证据显示：
+
+- 标题、域名、发布时间和抓取时间；
+- 权威级别；
+- 命中片段；
+- 页码、表格、段落或单元格定位；
+- 点击打开外部来源；
+- 内容不可访问时仍显示已保存的证据快照。
+
+不展示模型隐藏思维过程，只展示结构化输入摘要、输出、规则、校验和选择依据。
+
+### 13.5 快捷键
+
+建议默认：
+
+- `A`：批准；
+- `E`：进入编辑；
+- `R`：驳回重采；
+- `S`：跳过；
+- `J/K`：下一条/上一条；
+- `Ctrl/Cmd + Enter`：保存并下一条；
+- `Esc`：取消未保存修改。
+
+快捷键在输入框聚焦时不能误触。
+
+## 14. 审核 API
+
+```text
+GET  /api/v1/tasks/:taskId/review-summary
+GET  /api/v1/tasks/:taskId/review-items
+GET  /api/v1/review-items/:itemId/context
+POST /api/v1/review-items/:itemId/decisions
+POST /api/v1/review-items/:itemId/retry
+POST /api/v1/reviews/bulk
+```
+
+单条决定：
+
+```json
+{
+  "expectedVersion": 4,
+  "decision": "CORRECTED",
+  "fieldOverrides": {
+    "data": "123.4000",
+    "unit": "亿元"
+  },
+  "candidateId": "...",
+  "comment": "依据报告第 12 页修正单位"
+}
+```
+
+服务端行为：
+
+1. 检查权限和版本；
+2. 加载 RowContract、候选和当前审核状态；
+3. 合并 field overrides；
+4. 重新执行类型、单位和跨字段校验；
+5. 创建不可变 review decision；
+6. 创建或更新 final value 版本；
+7. 更新任务审核统计；
+8. 标记相关正式导出为 `STALE`；
+9. 写入 task event 和 audit log。
+
+### 14.1 批量审核
+
+请求必须使用服务端 filter snapshot，而不是发送成千上万个完整对象：
+
+```json
+{
+  "taskId": "...",
+  "filter": {
+    "datasetId": "ai_index",
+    "confidenceBand": "HIGH",
+    "reviewStatus": "UNREVIEWED",
+    "hasConflict": false
+  },
+  "excludedItemIds": [],
+  "decision": "APPROVED",
+  "previewToken": "..."
+}
+```
+
+流程：
+
+1. 前端请求批量操作预览；
+2. 后端返回数量、样本、风险和短期 preview token；
+3. 用户确认；
+4. 后端使用同一筛选快照执行；
+5. 如果数据版本改变则拒绝并要求重新预览。
+
+## 15. 导出应用设计
+
+### 15.1 Readiness
+
+```text
+GET /api/v1/tasks/:taskId/export-readiness
+```
+
+响应包含：
+
+- ready；
+- task execution/review status；
+- 未审核必需结果组；
+- rejected；
+- skipped；
+- collection failed；
+- conflict；
+- stale review；
+- 可跳转的筛选链接。
+
+### 15.2 创建导出
+
+```text
+POST /api/v1/tasks/:taskId/exports
+```
+
+请求：
+
+```json
+{
+  "strategy": "STRICT_COMPLETE",
+  "includeAuditSheet": true,
+  "expectedReviewVersion": 28
+}
+```
+
+后端在同一事务：
+
+1. 再次计算 readiness；
+2. 锁定 task review version；
+3. 创建 immutable export snapshot；
+4. 创建 export job 和 outbox；
+5. 返回 `202`。
+
+worker 只读取 snapshot，不读取可能继续变化的“当前值”。
+
+### 15.3 下载
+
+- 只有 `AVAILABLE` 可下载；
+- API 检查权限后返回短期签名 URL 或流式文件；
+- 文件名包含原文件名、任务 ID、审核版本和时间；
+- 页面显示 SHA256；
+- `STALE` 文件仍可作为历史下载，但必须明确标记不是最新结果。
+
+## 16. 模板应用设计
+
+### 16.1 模板编辑
+
+模板不是普通 JSON 文本框。界面按工作表提供：
+
+- 工作表匹配；
+- header 行；
+- descriptor fields；
+- target groups；
+- business key；
+- mode；
+- source policy；
+- field type 和单位；
+- blank semantics；
+- validation；
+- export mapping。
+
+管理员可以查看生成的 JSON，但通过结构化表单修改。
+
+### 16.2 发布
+
+- 草稿可以修改；
+- 发布前对样本文件执行 dry-run；
+- 发布生成不可变版本和 hash；
+- 已有任务继续使用原版本；
+- 新任务默认使用最新兼容版本；
+- 回退实际上是基于旧版本创建新版本。
+
+## 17. 管理应用设计
+
+### 17.1 系统状态
+
+- API 版本；
+- 数据库 migration 版本；
+- worker 数和最近心跳；
+- 队列深度；
+- OMLX 可用性、延迟和模型 alias；
+- OMLX 文本/视觉分类队列、当前并发和能力探测状态；
+- 最近一次工作簿/图片识别金标回归结果；
+- 对象存储；
+- 最近连续错误；
+- 卡住任务。
+
+### 17.2 模型配置
+
+只显示：
+
+- alias；
+- endpoint 主机；
+- model name；
+- 实际模型修订和量化；
+- capabilities：`vision`、`structured_output`、MIME 和输入上限；
+- 是否配置 key；
+- timeout；
+- max concurrency；
+- 健康状态；
+- 最近能力探测时间与结果。
+
+永不通过 GET API 返回 key。
+
+### 17.3 来源配置
+
+- adapter 类型；
+- authority tier；
+- allowed domain；
+- QPS/concurrency；
+- 凭据是否配置；
+- 保留策略；
+- 最近成功率。
+
+## 18. 权限矩阵
+
+| 能力 | VIEWER | REVIEWER | OPERATOR | ADMIN |
+| --- | :---: | :---: | :---: | :---: |
+| 查看任务和结果 | ✓ | ✓ | ✓ | ✓ |
+| 下载原文件 | 按授权 | 按授权 | ✓ | ✓ |
+| 创建任务 |  |  | ✓ | ✓ |
+| 启动/暂停/恢复/停止 |  |  | ✓ | ✓ |
+| 单条审核 |  | ✓ | 可选 | ✓ |
+| 批量审核 |  | ✓ | 可选 | ✓ |
+| 创建正式导出 |  |  | ✓ | ✓ |
+| 下载正式导出 | 按授权 | 按授权 | ✓ | ✓ |
+| 删除任务 |  |  | ✓ | ✓ |
+| 修改/发布模板 |  |  |  | ✓ |
+| 管理用户和系统 |  |  |  | ✓ |
+
+权限最终由后端判断。表格只描述默认角色策略。
+
+## 19. 错误分类与用户提示
+
+### 19.1 错误类别
+
+| 类别 | 示例 | 默认动作 |
+| --- | --- | --- |
+| 输入错误 | 工作表缺失、表头不兼容 | 返回向导修复 |
+| 状态冲突 | 已暂停任务再次暂停 | 刷新状态和 allowedActions |
+| 来源错误 | 404、超时、限流 | 自动重试或换来源 |
+| 内容错误 | PDF 无法解析 | 尝试替代解析器或转人工 |
+| 识别冲突 | 规则、模板和视觉模型结论不一致 | 在分析预览中高亮冲突并要求确认 |
+| 视觉不可用 | OMLX 不支持当前图片或超时 | 使用文本/模板降级，明确标记未识别图片 |
+| 采集错误 | 没有候选值 | 进入异常审核 |
+| 校验错误 | 单位不匹配 | 禁止自动建议，展示原因 |
+| 模型错误 | 非法 JSON、服务不可用 | 有界重试，之后进入失败 |
+| 权限错误 | 无权访问文件 | 返回 403，不泄露资源存在性 |
+| 系统错误 | 数据库或对象存储失败 | requestId + 管理员告警 |
+
+### 19.2 提示原则
+
+- 告诉用户发生了什么；
+- 告诉用户当前数据是否安全；
+- 告诉用户下一步可以做什么；
+- 技术细节折叠并附 requestId；
+- 不展示堆栈、SQL、密钥和内部 URL 凭据。
+
+## 20. SSE 事件与前端更新
+
+主要事件：
+
+- `task.status.changed`；
+- `task.stats.updated`；
+- `dataset.status.changed`；
+- `task.error.raised`；
+- `review.stats.updated`；
+- `export.status.changed`。
+
+前端处理：
+
+- 根据 event sequence 去重；
+- 检测 sequence 缺口时重新连接；
+- 高频 progress 事件节流渲染；
+- SSE 断开时每 10 秒轮询任务摘要；
+- 浏览器恢复前台时立即刷新。
+
+## 21. 可访问性和效率
+
+- 所有任务状态不仅用颜色，也使用文字和图标；
+- 审核操作可以只用键盘完成；
+- 表格有明确焦点和屏幕阅读器标签；
+- 对话框焦点锁定并可 Esc 关闭，破坏性确认除外；
+- 长列表使用虚拟化时保持键盘导航；
+- 常用筛选可保存为个人视图；
+- 记住审核三栏宽度；
+- 时间显示本地时区并可查看原始 UTC；
+- 数字按字段规则格式化，不改变原始精度。
+
+## 22. 前端组件建议
+
+```text
+TaskStatusBadge
+ReviewStatusBadge
+ExportStatusBadge
+AllowedActionsMenu
+TaskProgressSummary
+DatasetProgressTable
+WorkbookSheetPreview
+SheetRecognitionPreview
+RecognitionConflictPanel
+FieldMappingEditor
+RowQueue
+RowComparisonPanel
+CandidateList
+EvidenceViewer
+MediaEvidenceViewer
+ValidationBreakdown
+ReviewActionBar
+BulkReviewPreviewDialog
+ExportReadinessPanel
+TaskEventTimeline
+SystemHealthPanel
+```
+
+组件只接收展示 DTO 和回调，不直接拼 URL 或执行 fetch。
+
+## 23. 查询投影
+
+为避免前端页面直接加载复杂领域关系，后端提供读模型：
+
+- `TaskListItemView`；
+- `TaskDetailView`；
+- `WorkbookAnalysisView`；
+- `RecognitionConflictView`；
+- `DatasetProgressView`；
+- `ReviewQueueItemView`；
+- `ReviewContextView`；
+- `ExportReadinessView`；
+- `SystemHealthView`。
+
+读模型可以使用专用 SQL/CTE，不要求通过领域 repository 逐个加载实体。写模型仍遵守领域边界。
+
+## 24. 测试设计
+
+### 24.1 后端
+
+- application handler 单元测试；
+- 状态冲突和权限测试；
+- OpenAPI snapshot；
+- idempotency；
+- review version conflict；
+- batch preview token；
+- export snapshot isolation；
+- SSE replay。
+- 视觉模型能力探测和 OpenAI 兼容图像请求合约；
+- OOXML 结构图、工作表渲染和识别融合金标；
+- 模型识别越界、幻觉坐标和冲突强制转人工。
+
+### 24.2 前端
+
+- 向导表单和阻断条件；
+- allowedActions 显示；
+- SSE 断线降级；
+- 审核快捷键；
+- 未保存修改保护；
+- 版本冲突处理；
+- 批量审核预览；
+- export readiness 阻断导航；
+- 渲染图和字段映射双向定位；
+- 识别冲突只展示可审计理由；
+- 确认识别结果并保存为新模板版本。
+
+### 24.3 端到端关键路径
+
+1. 登录；
+2. 上传 275 行文件；
+3. 自动匹配模板；
+4. 对一份新结构工作簿完成多模态识别、冲突确认和模板保存；
+5. 创建并启动任务；
+6. 暂停、恢复；
+7. 查看异常；
+8. 审核和修正；
+9. 未完成审核时导出被阻止；
+10. 完成审核；
+11. 创建并下载正式导出；
+12. 修改一个已审核值，旧导出变为 `STALE`。
+
+## 25. 应用实施顺序
+
+### 25.1 API 骨架
+
+- 统一 response/error；
+- requestId；
+- session 和 CSRF；
+- permission dependency；
+- OpenAPI 生成和前端 Client。
+
+### 25.2 文件和任务最小闭环
+
+- 上传；
+- 分析状态；
+- 新建向导；
+- 任务列表和详情；
+- start/pause/resume/stop；
+- SSE。
+
+### 25.3 采集结果查询
+
+- 数据集进度；
+- review queue；
+- review context；
+- evidence viewer。
+
+### 25.4 审核和导出
+
+- 单条审核；
+- 版本冲突；
+- 批量审核；
+- readiness；
+- export job 和下载。
+
+### 25.5 管理与优化
+
+- 模板管理；
+- 系统状态；
+- 用户和角色；
+- 质量效率看板。
+
+## 26. 应用设计完成条件
+
+进入 UI 和 API 全面开发前，至少确认：
+
+1. 页面路由和角色权限；
+2. 任务、审核和导出三套状态及 allowedActions；
+3. 新建任务向导字段；
+4. ReviewContext DTO；
+5. 单条和批量审核语义；
+6. `SKIPPED` 是否允许排除后导出；
+7. OpenAPI 第一版；
+8. 设计原型能够让用户在不离开核对页面的情况下判断常规数据；
+9. 275 行端到端测试脚本；
+10. 正式导出和内部预览的权限及视觉区分。
