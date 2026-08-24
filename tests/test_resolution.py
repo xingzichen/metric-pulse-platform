@@ -36,3 +36,26 @@ def test_execution_failure_is_not_evaluated() -> None:
         validation=None,
     )
     assert status == ResolutionStatus.NOT_EVALUATED
+
+
+def test_unitless_ai_index_can_resolve_with_an_intentionally_blank_raw_unit() -> None:
+    status, reason, risk = classify_resolution(
+        execution_status=UnitStatus.SUCCEEDED,
+        target_fields=["be_data", "be_unit", "data"],
+        values={"be_data": 95, "be_unit": None, "data": 95},
+        validation={
+            "valid": True,
+            "evidence_approved": True,
+            "valid_empty_fields": ["be_unit"],
+            "conversion": {
+                "status": "SAME_UNIT",
+                "mode": "DETERMINISTIC",
+                "normalized_source_unit": "无量纲",
+                "normalized_target_unit": "无量纲",
+            },
+        },
+    )
+
+    assert status == ResolutionStatus.RESOLVED
+    assert reason == "VALIDATED_COMPLETE"
+    assert risk == "LOW"

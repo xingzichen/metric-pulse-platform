@@ -29,6 +29,19 @@ const detail = useQuery({
   enabled: computed(() => !!form.file_id),
   queryFn: () => api<FileItem>(`/api/v1/files/${form.file_id}`),
 });
+const excludedSheets = computed(() =>
+  (detail.data.value?.analysis?.sheets || []).filter(
+    (sheet: AnalysisSheet) => sheet.excluded,
+  ),
+);
+const exclusionSummary = computed(() =>
+  excludedSheets.value
+    .map(
+      (sheet: AnalysisSheet) =>
+        `${sheet.name}（${sheet.exclusion_reason?.label || "不由本平台处理"}）`,
+    )
+    .join("；"),
+);
 watch(
   () => detail.data.value?.analysis,
   (analysis) => {
@@ -64,6 +77,15 @@ async function submit() {
       <div class="muted">模型建议可以调整，提交后行约束将冻结以保证可追溯</div>
     </div>
   </div>
+  <el-alert
+    v-if="excludedSheets.length"
+    title="已按业务边界排除以下工作表"
+    :description="exclusionSummary"
+    type="info"
+    :closable="false"
+    show-icon
+    style="margin-bottom: 18px"
+  />
   <el-form label-position="top"
     ><el-card class="card"
       ><el-form-item label="任务名称"

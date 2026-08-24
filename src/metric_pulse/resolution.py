@@ -38,7 +38,21 @@ def classify_resolution(
     if validation.get("conflict") is True or (isinstance(conflicts, list) and conflicts):
         return ResolutionStatus.CONFLICT, "EVIDENCE_CONFLICT", RiskLevel.HIGH
 
-    value_fields = [field for field in target_fields if field not in PROVENANCE_FIELDS]
+    conversion = validation.get("conversion")
+    conversion_status = conversion.get("status") if isinstance(conversion, dict) else None
+    if conversion_status in {"DIMENSION_MISMATCH", "INVALID_RESULT"}:
+        return ResolutionStatus.INVALID, "UNIT_CONVERSION_INVALID", RiskLevel.HIGH
+    if conversion_status in {"MISSING_SOURCE_UNIT", "NON_NUMERIC"}:
+        return ResolutionStatus.UNRESOLVED, "RAW_OBSERVATION_INCOMPLETE", RiskLevel.HIGH
+
+    valid_empty_fields = {
+        str(field) for field in validation.get("valid_empty_fields", []) if isinstance(field, str)
+    }
+    value_fields = [
+        field
+        for field in target_fields
+        if field not in PROVENANCE_FIELDS and field not in valid_empty_fields
+    ]
     evaluated_fields = value_fields or list(target_fields)
     present = [field for field in evaluated_fields if values.get(field) not in (None, "")]
     if not present:
@@ -50,9 +64,13 @@ def classify_resolution(
 
     evidence_approved = validation.get("evidence_approved")
     risk = (
-        RiskLevel.LOW
-        if evidence_approved is True or validation.get("fixture") is True
-        else RiskLevel.MEDIUM
+        RiskLevel.HIGH
+        if validation.get("model_conversion_fallback") is True
+        else (
+            RiskLevel.LOW
+            if evidence_approved is True or validation.get("fixture") is True
+            else RiskLevel.MEDIUM
+        )
     )
     return ResolutionStatus.RESOLVED, "VALIDATED_COMPLETE", risk
 

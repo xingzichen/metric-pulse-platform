@@ -36,6 +36,7 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from .celery_app import dispatch_task
 from .config import get_settings
+from .dataset_profiles import excluded_sheet_policy, has_locked_dataset_profile
 from .db import SessionLocal, create_schema, get_session
 from .models import (
     AuditLog,
@@ -181,7 +182,12 @@ def persist_analysis(db: Session, file: FileRecord, analysis: dict[str, Any]) ->
                 business_key_fields=item["business_key_fields"],
                 confidence=item["confidence"],
                 needs_confirmation=item["needs_confirmation"],
-                profile={"mode": item["mode"], "fieldStats": item["field_stats"]},
+                profile={
+                    "mode": item["mode"],
+                    "fieldStats": item["field_stats"],
+                    "excluded": bool(item.get("excluded")),
+                    "exclusionReason": item.get("exclusion_reason"),
+                },
             )
         )
     db.commit()
@@ -203,17 +209,49 @@ async def vision_recognize_file(file_id: str) -> None:
         source = FileObjectStore().path(file.object_key)
         client = OMLXClient()
         changed = False
+        processable_sheets = []
+        for sheet in file.analysis["sheets"]:
+            exclusion = excluded_sheet_policy(sheet["name"])
+            if exclusion:
+                sheet["vision"] = {
+                    "skipped": True,
+                    "reason": exclusion,
+                    "roleOverrideLocked": True,
+                }
+                sheet["needs_confirmation"] = False
+                changed = True
+            elif has_locked_dataset_profile(sheet["name"], sheet["headers"]):
+                # 专用 Profile 的字段角色已经由业务和确定性代码完整定义。继续把截图送入唯一
+                # 的 OMLX 通道不会改变结果，只会推迟真实采集，因此直接记录为契约锁定跳过。
+                sheet["vision"] = {
+                    "skipped": True,
+                    "reason": {
+                        "code": "PROFILE_CONTRACT_LOCKED",
+                        "label": "业务采集契约已锁定",
+                    },
+                    "roleOverrideLocked": True,
+                }
+                sheet["needs_confirmation"] = False
+                changed = True
+            else:
+                processable_sheets.append(sheet)
+        if not processable_sheets:
+            file.analysis["needs_confirmation"] = False
+            persist_analysis(db, file, file.analysis)
+            return
         try:
             await client.health()
         except Exception as exc:
             error = f"OMLX preflight failed: {exc}"
-            for sheet in file.analysis["sheets"]:
+            for sheet in processable_sheets:
                 sheet["vision"] = {"error": error, "valid": False}
                 sheet["needs_confirmation"] = True
-            file.analysis["needs_confirmation"] = True
+            file.analysis["needs_confirmation"] = any(
+                sheet["needs_confirmation"] for sheet in file.analysis["sheets"]
+            )
             persist_analysis(db, file, file.analysis)
             return
-        for sheet in file.analysis["sheets"]:
+        for sheet in processable_sheets:
             try:
                 preview = render_sheet_preview(source, sheet["name"])
                 proposal = await client.analyze_sheet(
@@ -238,13 +276,27 @@ async def vision_recognize_file(file_id: str) -> None:
                     set(proposal.get(key, [])) <= headers
                     for key in ("descriptor_fields", "target_fields", "business_key_fields")
                 )
-                sheet["vision"] = {"proposal": proposal, "valid": fields_valid}
+                profile_locked = has_locked_dataset_profile(sheet["name"], sheet["headers"])
+                sheet["vision"] = {
+                    "proposal": proposal,
+                    "valid": fields_valid,
+                    "roleOverrideLocked": profile_locked,
+                }
                 if fields_valid and not proposal.get("conflicts"):
-                    for key in ("descriptor_fields", "target_fields", "business_key_fields", "mode"):
-                        if key in proposal:
-                            sheet[key] = proposal[key]
-                    sheet["confidence"] = min(0.99, float(proposal.get("confidence", 0.8)))
-                    sheet["needs_confirmation"] = sheet["confidence"] < 0.9
+                    if not profile_locked:
+                        for key in (
+                            "descriptor_fields",
+                            "target_fields",
+                            "business_key_fields",
+                            "mode",
+                        ):
+                            if key in proposal:
+                                sheet[key] = proposal[key]
+                        sheet["confidence"] = min(
+                            0.99,
+                            float(proposal.get("confidence", 0.8)),
+                        )
+                        sheet["needs_confirmation"] = sheet["confidence"] < 0.9
                 else:
                     sheet["needs_confirmation"] = True
                 changed = True
@@ -468,6 +520,15 @@ async def create_task(
             for sheet in file.analysis["sheets"]
             if sheet["target_fields"]
         ]
+    analysis_by_name = {sheet["name"]: sheet for sheet in file.analysis["sheets"]}
+    for dataset in datasets:
+        sheet = analysis_by_name.get(dataset["sheet_name"])
+        exclusion = excluded_sheet_policy(sheet["name"]) if sheet else None
+        if exclusion:
+            raise HTTPException(
+                status_code=422,
+                detail=f"工作表 {sheet['name']!r} 不由本平台处理: {exclusion['label']}",
+            )
     task = CollectionTask(
         owner_id=user.id,
         file_id=file.id,

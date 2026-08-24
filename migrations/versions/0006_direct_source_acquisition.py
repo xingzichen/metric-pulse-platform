@@ -12,6 +12,8 @@ depends_on = None
 
 
 def upgrade() -> None:
+    if "source_acquisition_attempts" in sa.inspect(op.get_bind()).get_table_names():
+        return
     op.create_table(
         "source_acquisition_attempts",
         sa.Column("id", sa.String(36), primary_key=True),

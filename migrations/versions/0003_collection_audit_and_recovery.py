@@ -12,6 +12,16 @@ depends_on = None
 
 
 def upgrade() -> None:
+    inspector = sa.inspect(op.get_bind())
+    existing_tables = set(inspector.get_table_names())
+    unit_columns = {column["name"] for column in inspector.get_columns("collection_units")}
+    if {
+        "row_search_attempts",
+        "model_calls",
+        "source_snapshots",
+        "unit_source_links",
+    }.issubset(existing_tables) and {"lease_owner", "next_attempt_at"}.issubset(unit_columns):
+        return
     op.add_column("collection_units", sa.Column("lease_owner", sa.String(120), nullable=True))
     op.add_column("collection_units", sa.Column("next_attempt_at", sa.DateTime(timezone=True), nullable=True))
     op.create_index("ix_collection_units_next_attempt_at", "collection_units", ["next_attempt_at"])

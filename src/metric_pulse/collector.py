@@ -25,6 +25,9 @@ from urllib.parse import urlparse
 import httpx
 
 from .config import get_settings
+from .dataset_profiles import AI_ALGORITHM_COLLECTION_PROFILE, TOP_LIST_AI_PROFILE
+from .forbes_ai50 import ForbesAI50Error, prepare_forbes_ai50_company_document
+from .github_ranking import GitHubRankingError, prepare_github_rank_document
 from .models import CollectionUnit, DataRecord
 from .omlx import OMLXClient
 from .source_pipeline import (
@@ -32,6 +35,11 @@ from .source_pipeline import (
     build_contact_sheet,
     gather_source_documents,
     normalize_source_url,
+)
+from .unit_conversion import (
+    ConversionStatus,
+    convert_unit,
+    model_fallback_conversion,
 )
 
 _SEARCH_THROTTLE_LOCK = asyncio.Lock()
@@ -241,7 +249,11 @@ def extract_structured_values(
     ]
     value_fields = {"be_data", "data", "value", "result"}
     if len(unmatched_numbers) == 1:
-        for target_field in target_fields:
+        inferred_targets = [field for field in target_fields if field.lower() in value_fields]
+        # 原始值和标准值语义不同；两者同时出现时，来源数字只能确定 be_data。
+        if "be_data" in inferred_targets and "data" in inferred_targets:
+            inferred_targets = [field for field in inferred_targets if field != "data"]
+        for target_field in inferred_targets:
             if target_field.lower() in value_fields and target_field not in values:
                 values[target_field] = unmatched_numbers[0]
     if set(values) != set(target_fields):
@@ -454,6 +466,147 @@ def apply_verification(
     return values, approved
 
 
+def required_contract_matches(
+    row_contract: dict[str, Any], verification: dict[str, Any]
+) -> tuple[bool, list[str]]:
+    """检查 VERIFY 是否逐项确认 ai_index 主体和全部非空联合约束。"""
+
+    required = row_contract.get("required_matches", [])
+    if not required:
+        return True, []
+    matches = verification.get("constraint_matches")
+    if not isinstance(matches, dict):
+        return False, list(required)
+    missing = [field for field in required if matches.get(field) is not True]
+    return not missing, missing
+
+
+def apply_ai_index_conversion(
+    *,
+    values: dict[str, Any],
+    row_contract: dict[str, Any],
+    verification: dict[str, Any],
+    evidence_approved: bool,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """程序优先生成标准值，只在未知单位表达式时采用模型转换候选。"""
+
+    roles = row_contract.get("field_roles") or {}
+    if "data" not in roles.get("derived", []):
+        return values, None
+    program_result = convert_unit(
+        values.get("be_data"),
+        values.get("be_unit"),
+        row_contract.get("standard_unit"),
+    )
+    conversion = program_result
+    if evidence_approved and program_result.status == ConversionStatus.UNSUPPORTED:
+        conversion = model_fallback_conversion(
+            program_result=program_result,
+            verification=verification,
+        ) or program_result
+    result = dict(values)
+    result["data"] = (
+        conversion.result
+        if evidence_approved
+        and conversion.status in {ConversionStatus.CONVERTED, ConversionStatus.SAME_UNIT}
+        else None
+    )
+    return result, conversion.to_dict()
+
+
+def apply_ai_algorithm_collection_values(
+    *,
+    values: dict[str, Any],
+    row_contract: dict[str, Any],
+    deterministic_values: dict[str, Any],
+    evidence_approved: bool,
+) -> dict[str, Any]:
+    """在模型核验通过后写入榜单事实与应用拥有字段。
+
+    GitHub 精确收藏数、排名和 ``k`` 换算都由程序确定。模型只对当前名次的仓库名称与换算后
+    数值进行证据复核，不能生成或改写时间、固定元数据和业务键。
+    """
+
+    if (
+        row_contract.get("profile") != AI_ALGORITHM_COLLECTION_PROFILE
+        or not evidence_approved
+    ):
+        return values
+    name = deterministic_values.get("name")
+    star = deterministic_values.get("star")
+    snapshot_at = row_contract.get("snapshot_at")
+    if not isinstance(name, str) or not name or not isinstance(star, int) or not snapshot_at:
+        return values
+    result = dict(values)
+    if "name" in result:
+        result["name"] = name
+    if "star" in result:
+        result["star"] = star
+    for fixed_field, value in (row_contract.get("fixed_values") or {}).items():
+        if fixed_field in result:
+            result[fixed_field] = value
+    if "logic_id" in result:
+        result["logic_id"] = hashlib.sha256(f"{name}\n{snapshot_at}".encode()).hexdigest()
+    return result
+
+
+def apply_top_list_ai_values(
+    *,
+    values: dict[str, Any],
+    row_contract: dict[str, Any],
+    deterministic_values: dict[str, Any],
+    evidence_approved: bool,
+) -> dict[str, Any]:
+    """写入福布斯年度名单的程序拥有字段，并保留模型核验后的中文总部。
+
+    公司名、已有官方 CEO、成立年份和融资额都直接来自严格解析的官方快照；模型不能改写。
+    少数官方结构字段未给 CEO 时，允许两阶段模型仅依据同一条官方描述补出明确写明的 CEO。
+    """
+
+    if row_contract.get("profile") != TOP_LIST_AI_PROFILE or not evidence_approved:
+        return values
+    name = str(deterministic_values.get("company_name") or "").strip()
+    rank_year = deterministic_values.get("rank_year")
+    financing_amount = deterministic_values.get("financing_amount")
+    establish_date = deterministic_values.get("establish_date")
+    datasource_date = deterministic_values.get("datasource_date")
+    if (
+        not name
+        or not isinstance(rank_year, int)
+        or not isinstance(financing_amount, int | float)
+        or isinstance(financing_amount, bool)
+        or not isinstance(establish_date, int)
+        or not datasource_date
+    ):
+        return values
+    result = dict(values)
+    deterministic_observed = {
+        "company_name": name,
+        "financing_amount": financing_amount,
+        "financing_amount_unit": "亿美元",
+        "establish_date": establish_date,
+    }
+    ceo = deterministic_values.get("CEO")
+    if isinstance(ceo, str) and ceo.strip():
+        deterministic_observed["CEO"] = ceo.strip()
+    for field_name, value in deterministic_observed.items():
+        if field_name in result:
+            result[field_name] = value
+    for fixed_field, value in (row_contract.get("fixed_values") or {}).items():
+        if fixed_field in result:
+            result[fixed_field] = value
+    if "datasource_date" in result:
+        result["datasource_date"] = datasource_date
+    if "source_url" in result:
+        result["source_url"] = row_contract.get("canonical_source_url")
+    if "logic_id" in result:
+        normalized_name = re.sub(r"\s+", " ", name).strip().casefold()
+        result["logic_id"] = hashlib.sha256(
+            f"{rank_year}\n{normalized_name}".encode()
+        ).hexdigest()
+    return result
+
+
 def render_source_documents(
     documents: list[SourceDocument],
     descriptors: dict[str, Any],
@@ -621,6 +774,10 @@ def build_search_query(record: DataRecord) -> str:
     )
     if identity:
         parts.append(f'"{identity}"')
+    for key in ("level", "scope"):
+        value = descriptors.get(key)
+        if value not in (None, "") and str(value) not in parts:
+            parts.append(str(value))
     for keys in (location_keys, date_keys):
         for key in keys:
             value = descriptors.get(key)
@@ -654,6 +811,10 @@ class OMLXCollector:
         不复用可能混入其他行结论的对话历史。
         """
 
+        profile = record.row_contract.get("profile")
+        github_collection = profile == AI_ALGORITHM_COLLECTION_PROFILE
+        forbes_ai50 = profile == TOP_LIST_AI_PROFILE
+        fixed_snapshot_profile = github_collection or forbes_ai50
         descriptors = record.row_contract.get("descriptors", {})
         query = build_search_query(record)
         input_source_url = next(
@@ -665,7 +826,26 @@ class OMLXCollector:
             None,
         )
         settings = get_settings()
-        value_target_fields = [field for field in unit.target_fields if field not in {"source", "source_url"}]
+        value_target_fields = [
+            field for field in unit.target_fields if field not in {"source", "source_url"}
+        ]
+        field_roles = record.row_contract.get("field_roles") or {}
+        observed_fields = [
+            field for field in field_roles.get("observed", []) if field in unit.target_fields
+        ]
+        model_target_fields = observed_fields if fixed_snapshot_profile else unit.target_fields
+        verification_value_fields = (
+            observed_fields if fixed_snapshot_profile else value_target_fields
+        )
+        # 结构化来源先确定原始数值候选；原始单位可能来自列名、轴标签或正文，交给模型复核。
+        extraction_target_fields = (
+            []
+            if forbes_ai50
+            else ["be_data"]
+            if "be_data" in observed_fields
+            else model_target_fields
+        )
+        profile_deterministic_values: dict[str, Any] = {}
 
         async def gather(candidates: list[EvidenceItem]) -> list[SourceDocument]:
             return await gather_source_documents(
@@ -686,7 +866,81 @@ class OMLXCollector:
         direct_succeeded = False
         fallback_reason: str | None = "NO_DIRECT_SOURCE"
         match_metadata: dict[str, Any] = {"match_status": "NO_DIRECT_SOURCE", "match_count": 0}
-        if input_source_url:
+        if github_collection:
+            acquisition_url = record.row_contract.get("acquisition_url")
+            if not isinstance(acquisition_url, str) or not acquisition_url:
+                raise RuntimeError("GitHub ranking profile has no acquisition URL")
+            direct_documents = await gather(
+                [
+                    EvidenceItem(
+                        source_url=acquisition_url,
+                        title="GitHub repository search API",
+                        metadata={
+                            "provider": "github-api",
+                            "cache_scope": record.row_contract.get("snapshot_at"),
+                        },
+                    )
+                ]
+            )
+            try:
+                ranked_document, profile_deterministic_values = prepare_github_rank_document(
+                    direct_documents[0],
+                    rank=int(record.row_contract.get("rank") or 0),
+                )
+            except (GitHubRankingError, IndexError, TypeError, ValueError) as exc:
+                # 该数据集的榜单定义绑定固定 GitHub 查询；换搜索源会改变业务口径，必须失败
+                # 关闭并交给处理器按既有重试策略重试。
+                raise RuntimeError(f"GitHub ranking acquisition is incomplete: {exc}") from exc
+            direct_documents = [ranked_document]
+            direct_succeeded, fallback_reason, match_metadata = evaluate_direct_documents(
+                direct_documents,
+                descriptors,
+                extraction_target_fields,
+            )
+            if not direct_succeeded:
+                raise RuntimeError(
+                    "GitHub ranking evidence does not uniquely match the required rank: "
+                    f"{fallback_reason}"
+                )
+        elif forbes_ai50:
+            acquisition_url = record.row_contract.get("acquisition_url")
+            if not isinstance(acquisition_url, str) or not acquisition_url:
+                raise RuntimeError("Forbes AI 50 profile has no acquisition URL")
+            direct_documents = await gather(
+                [
+                    EvidenceItem(
+                        source_url=acquisition_url,
+                        title="Forbes official AI 50 list",
+                        metadata={
+                            "provider": "forbes-official",
+                            "cache_scope": record.row_contract.get("snapshot_at"),
+                        },
+                    )
+                ]
+            )
+            try:
+                company_document, profile_deterministic_values = (
+                    prepare_forbes_ai50_company_document(
+                        direct_documents[0],
+                        list_position=int(record.row_contract.get("list_position") or 0),
+                        expected_year=int(record.row_contract.get("rank_year") or 0),
+                    )
+                )
+            except (ForbesAI50Error, IndexError, TypeError, ValueError) as exc:
+                # 年度名单绑定唯一福布斯官方页面。数量、年度或结构异常只能重试，不能通过
+                # 搜索/转载页面拼出一份口径不一致的“Top 50”。
+                raise RuntimeError(f"Forbes AI 50 acquisition is incomplete: {exc}") from exc
+            direct_documents = [company_document]
+            direct_succeeded = True
+            fallback_reason = None
+            match_metadata = {
+                "match_status": "OFFICIAL_ANNUAL_POSITION_MATCH",
+                "match_count": 1,
+                "list_position": record.row_contract.get("list_position"),
+                "rank_year": record.row_contract.get("rank_year"),
+                "declared_count": 50,
+            }
+        elif input_source_url:
             direct_documents = await gather(
                 [
                     EvidenceItem(
@@ -699,13 +953,13 @@ class OMLXCollector:
             direct_succeeded, fallback_reason, match_metadata = evaluate_direct_documents(
                 direct_documents,
                 descriptors,
-                value_target_fields,
+                extraction_target_fields,
             )
 
         if direct_succeeded:
             route = "DIRECT_LINK"
             documents = direct_documents
-        else:
+        elif not fixed_snapshot_profile:
             route = "SEARCH_FALLBACK"
             search_started_at = datetime.now(UTC)
             search_results = await discover_sources(query, limit=10)
@@ -727,6 +981,9 @@ class OMLXCollector:
                 "ended_at": search_ended_at,
             }
             documents = await gather(search_results)
+        else:
+            # 两个固定快照 Profile 上方已失败关闭；此分支只为类型检查明确 documents 已赋值。
+            raise RuntimeError("Fixed snapshot profile did not produce direct evidence")
 
         # 将来源获取过程与内容身份固化，缓存命中也必须能追溯到规范化 URL 和内容哈希。
         acquisition_ended_at = datetime.now(UTC)
@@ -768,12 +1025,12 @@ class OMLXCollector:
         evidence_text = render_source_documents(documents, descriptors)
         contact_sheet = build_contact_sheet(documents) if get_settings().vision_analysis_enabled else None
         structured_matches: list[tuple[SourceDocument, dict[str, Any], str]] = []
-        if value_target_fields:
+        if extraction_target_fields:
             for document in documents:
                 structured = extract_structured_values(
                     document.text,
                     descriptors,
-                    value_target_fields,
+                    extraction_target_fields,
                 )
                 if structured is not None:
                     values, excerpt = structured
@@ -782,19 +1039,30 @@ class OMLXCollector:
             {"source_index": document.index, "values": values, "excerpt": excerpt}
             for document, values, excerpt in structured_matches
         ]
+        raw_row_for_model = dict(record.raw_data)
+        if field_roles:
+            # 历史表内的 be_unit 只是提示，不是本次来源事实；清空输出角色避免模型照抄。
+            for field in set(field_roles.get("observed", [])) | set(field_roles.get("derived", [])):
+                raw_row_for_model[field] = None
         prompt = {
             "row_contract": record.row_contract,
-            "raw_row": record.raw_data,
-            "target_fields": unit.target_fields,
+            "raw_row": raw_row_for_model,
+            "target_fields": model_target_fields,
             "evidence_text": evidence_text,
             "deterministic_structured_candidates": structured_candidates,
             "requirements": {
-                "return": {"values": {field: "value or null" for field in unit.target_fields}},
+                "return": {"values": {field: "value or null" for field in model_target_fields}},
                 "do_not_invent": True,
                 "compare_all_sources": True,
                 "prefer_primary_or_authoritative_sources": True,
                 "report_source_indices": True,
                 "acquisition_route": route,
+                "observed_fields_must_share_one_source": field_roles.get("observed", []),
+                "standard_unit": record.row_contract.get("standard_unit"),
+                "existing_source_unit_is_hint_only": bool(field_roles),
+                "github_monthly_top10": github_collection,
+                "forbes_annual_ai50": forbes_ai50,
+                "forbes_list_position_is_not_rank": forbes_ai50,
             },
         }
         # 第二阶段：第一次模型调用只生成候选值，不具备最终批准权。
@@ -805,12 +1073,27 @@ class OMLXCollector:
                 "Evaluate all numbered sources together, including the attached visual evidence. "
                 "Extract only the requested target fields and respect every RowContract descriptor. "
                 "When structured evidence contains a header and a row matching the descriptors, treat the "
-                "observed metric cell as direct evidence; be_data and data are equivalent value fields. "
+                "observed metric cell as be_data. For an ai_index contract, extract be_data and be_unit "
+                "from the same cited source; the existing source_unit_hint is not evidence. data is a "
+                "conversion candidate in the standard unit, never an alias of be_data. Return a conversion "
+                "object with mode MODEL_FALLBACK, source_value, source_unit, target_unit, result, formula, "
+                "and reason when a conversion is needed. If standard_unit is null and the source truly "
+                "reports a unitless index or score, be_unit=null is a valid observed state. "
+                "For ai_algorithm_collection_monthly_v1, verify only the repository name and integer "
+                "star value in thousands for the required rank. The exact stargazers_count and the "
+                "floor(count / 1000) formula are evidence; never output the exact count as star. "
+                "For top_list_ai_forbes_annual_v1, process only the one official company row. The "
+                "list_position is an internal alphabetical page position, never a business rank. Preserve "
+                "company and CEO names, translate headquarters into concise Chinese, and treat "
+                "funding_official, "
+                "funding_millions and the deterministic 亿美元 value as one funding fact. If structured CEO "
+                "is empty, fill it only when the same official_description explicitly identifies the CEO. "
                 "Remove boilerplate, advertisements, navigation, and unrelated page content "
                 "from consideration. "
                 "Resolve conflicts by source authority, directness, date, and cross-source agreement. "
                 "Never repeat or transform the input structure. Return exactly one top-level JSON object "
-                "with keys values, evidence_excerpt, source_indices, confidence, and conflicts. "
+                "with keys values, evidence_excerpt, source_indices, confidence, conflicts, "
+                "constraint_matches, and conversion. "
                 "Use null when evidence is insufficient."
             ),
             prompt=(
@@ -824,8 +1107,8 @@ class OMLXCollector:
         # 第三阶段：第二次调用拿到相同证据及第一次候选，以独立审计者身份逐字段复核。
         audit_input = {
             "row_contract": record.row_contract,
-            "raw_row": record.raw_data,
-            "target_fields": unit.target_fields,
+            "raw_row": raw_row_for_model,
+            "target_fields": model_target_fields,
             "candidate": response,
             "numbered_sources": evidence_text,
             "deterministic_structured_candidates": structured_candidates,
@@ -839,11 +1122,27 @@ class OMLXCollector:
                 "city, company, or subset value cannot satisfy a national target; a country value cannot "
                 "satisfy a global target. Date/period, metric definition, population, and unit must "
                 "also match. "
+                "For every field listed in required_matches, return constraint_matches[field]=true only "
+                "when the cited evidence supports that exact identity or constraint. "
+                "For ai_index, verify be_data and be_unit as one source observation. Audit any proposed "
+                "unit conversion separately and preserve its source_value/source_unit/target_unit/formula. "
+                "When standard_unit is null, approve be_unit=null only if the cited source clearly presents "
+                "the metric as a unitless index or score. "
+                "For ai_algorithm_collection_monthly_v1, approve name/star only when the one-row GitHub "
+                "evidence has the required rank, and set constraint_matches.rank=true only for that exact "
+                "row. star must be the displayed integer-k value, not exact_stargazers_count. "
+                "For top_list_ai_forbes_annual_v1, approve only the one company at the required internal "
+                "list_position and rank_year. Set both constraint matches explicitly. The position is not a "
+                "rank. Headquarters may be a faithful Chinese translation. Funding must agree with the exact "
+                "official millions value and deterministic 亿美元 conversion. A missing structured CEO "
+                "may be "
+                "approved only when official_description explicitly says who the CEO is. "
                 "Do not approve a number merely because it is nearby or prominent. If the candidate is wrong "
                 "but an exact value is explicitly supported, correct it. Otherwise set it to null. "
                 "Return one "
                 "JSON object with approved, values, evidence_excerpt, source_indices, confidence, conflicts, "
-                "and reason. approved may be true only when every non-provenance target value is directly "
+                "constraint_matches, conversion, and reason. approved may be true only when every observed "
+                "non-provenance value is directly "
                 "supported by the cited source indices."
             ),
             prompt=(
@@ -855,10 +1154,22 @@ class OMLXCollector:
         )
         verify_telemetry = self._model_telemetry()
         verify_ended_at = datetime.now(UTC)
+        contract_valid, unmatched_constraints = required_contract_matches(
+            record.row_contract,
+            verification,
+        )
+        if not contract_valid:
+            verification = {**verification, "approved": False}
         values, evidence_approved = apply_verification(
             verification,
             unit.target_fields,
-            value_target_fields,
+            verification_value_fields,
+        )
+        values, conversion = apply_ai_index_conversion(
+            values=values,
+            row_contract=record.row_contract,
+            verification=verification,
+            evidence_approved=evidence_approved,
         )
         # 只有真实存在且被核验返回的编号才算引用；任意 URL 字符串都不能替代来源编号。
         selected_indices = {
@@ -883,6 +1194,18 @@ class OMLXCollector:
         )
         # 最终来源门禁：核验通过且存在可用的被引用文档时，应用才写入来源字段。
         if evidence_approved and selected_document:
+            values = apply_ai_algorithm_collection_values(
+                values=values,
+                row_contract=record.row_contract,
+                deterministic_values=profile_deterministic_values,
+                evidence_approved=evidence_approved,
+            )
+            values = apply_top_list_ai_values(
+                values=values,
+                row_contract=record.row_contract,
+                deterministic_values=profile_deterministic_values,
+                evidence_approved=evidence_approved,
+            )
             values = apply_source_provenance(
                 values,
                 unit.target_fields,
@@ -899,6 +1222,24 @@ class OMLXCollector:
             conflicts=verification.get("conflicts"),
             acquisition_route=route,
         )
+        if forbes_ai50 and isinstance(profile_deterministic_values.get("profile_url"), str):
+            # 公司详情页不参与自动值生成，避免把多页面内容混入当前模型上下文；但把官方链接
+            # 直接提供给审核员，遇到榜单结构字段缺失时无需再人工搜索。
+            evidence.append(
+                EvidenceItem(
+                    source_url=profile_deterministic_values["profile_url"],
+                    title=(
+                        "福布斯公司详情: "
+                        f"{profile_deterministic_values.get('company_name') or '当前公司'}"
+                    ),
+                    excerpt="福布斯官方公司详情页 (仅供人工核对, 不参与本次自动提取)",
+                    metadata={
+                        "provider": "forbes-official-profile-reference",
+                        "selected": False,
+                        "model_context_included": False,
+                    },
+                )
+            )
         for document, structured_values, excerpt in structured_matches:
             evidence.append(
                 EvidenceItem(
@@ -929,7 +1270,21 @@ class OMLXCollector:
                     },
                 )
             )
-        errors = [field for field, value in values.items() if value in (None, "")]
+        # 双空单位是 ai_index 对无量纲指数的既有 schema 表达。它是“已确认无单位”，
+        # 不是漏采；保留空单元格导出，同时通过 valid_empty_fields 告知解决状态判定器。
+        valid_empty_fields = []
+        if (
+            conversion
+            and conversion.get("status") == ConversionStatus.SAME_UNIT
+            and conversion.get("normalized_source_unit") == "无量纲"
+            and conversion.get("normalized_target_unit") == "无量纲"
+        ):
+            valid_empty_fields.append("be_unit")
+        errors = [
+            field
+            for field, value in values.items()
+            if value in (None, "") and field not in valid_empty_fields
+        ]
         return CollectionResult(
             values=values,
             evidence=evidence,
@@ -937,6 +1292,38 @@ class OMLXCollector:
                 "valid": evidence_approved and not errors,
                 "missing_fields": errors,
                 "evidence_approved": evidence_approved,
+                "contract_valid": contract_valid,
+                "unmatched_constraints": unmatched_constraints,
+                "constraint_matches": verification.get("constraint_matches", {}),
+                "conversion": conversion,
+                "valid_empty_fields": valid_empty_fields,
+                "model_conversion_fallback": bool(
+                    conversion and conversion.get("mode") == "MODEL_FALLBACK"
+                ),
+                "dataset_profile": profile,
+                "deterministic_profile_values": (
+                    {
+                        **profile_deterministic_values,
+                        "rank": record.row_contract.get("rank"),
+                        "star_transform": record.row_contract.get("star_transform"),
+                    }
+                    if github_collection
+                    else (
+                        {
+                            **profile_deterministic_values,
+                            "funding_conversion": {
+                                "mode": "DETERMINISTIC",
+                                "source_unit": "百万美元",
+                                "target_unit": "亿美元",
+                                "factor": "0.01",
+                                "formula": profile_deterministic_values.get("funding_formula"),
+                            },
+                            "list_position_is_rank": False,
+                        }
+                        if forbes_ai50
+                        else None
+                    )
+                ),
                 "reason": verification.get("reason"),
             },
             model=get_settings().omlx_model,

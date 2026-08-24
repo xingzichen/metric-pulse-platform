@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     search_timeout_seconds: float = 60
     search_min_interval_seconds: float = 60
     search_retry_delay_seconds: float = 60
+    github_api_token: str = ""
     source_fetch_concurrency: int = 3
     source_cache_ttl_seconds: int = 86_400
     browser_fallback_enabled: bool = True

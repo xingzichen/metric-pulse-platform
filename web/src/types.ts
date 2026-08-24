@@ -31,6 +31,12 @@ export interface AnalysisSheet {
   target_fields: string[];
   business_key_fields: string[];
   mode: string;
+  excluded?: boolean;
+  exclusion_reason?: {
+    sheet_id: string;
+    code: string;
+    label: string;
+  } | null;
   confidence: number;
   max_row: number;
 }

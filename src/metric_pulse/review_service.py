@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from typing import Any
@@ -14,6 +15,12 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .dataset_profiles import (
+    AI_ALGORITHM_COLLECTION_PROFILE,
+    FORBES_AI50_SOURCE_URL,
+    TOP_LIST_AI_COUNT,
+    TOP_LIST_AI_PROFILE,
+)
 from .models import (
     CollectionTask,
     CollectionUnit,
@@ -32,6 +39,7 @@ from .resolution import VALIDATION_VERSION, classify_resolution
 from .review_policy import record_sample_outcome
 from .storage import FileObjectStore, export_path
 from .task_service import add_event, audit, refresh_stats
+from .unit_conversion import ConversionStatus, convert_unit, model_fallback_conversion
 from .workbook import export_reviewed_workbook
 
 
@@ -69,6 +77,161 @@ def _complete_review_source_url(
     )
 
 
+def _apply_review_conversion(
+    unit: CollectionUnit,
+    values: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """人工修正 ai_index 原始观测后重新生成标准值和转换审计。
+
+    审核员可以修正来源原始值/单位，但不能直接覆盖派生字段 ``data``。程序规则优先；若原
+    建议已经通过同一轮 VERIFY 的模型转换降级，则仅在原始值和单位没有被改动时复用该审计，
+    不在审核请求中额外调用模型。其他未知或非法转换要求驳回重采/补规则，防止静默写错。
+    """
+
+    profile = unit.record.row_contract.get("profile")
+    if profile == AI_ALGORITHM_COLLECTION_PROFILE:
+        result = dict(values)
+        name = str(result.get("name") or "").strip()
+        raw_star = result.get("star")
+        if isinstance(raw_star, str) and raw_star.strip().isdigit():
+            raw_star = int(raw_star.strip())
+        if not name or not isinstance(raw_star, int) or isinstance(raw_star, bool) or raw_star < 0:
+            raise ValueError("Repository name and integer-k star value are required")
+        result.update(unit.record.row_contract.get("fixed_values") or {})
+        result["name"] = name
+        result["star"] = raw_star
+        if "source_url" in result:
+            result["source_url"] = unit.record.row_contract.get("canonical_source_url")
+        if "logic_id" in result:
+            snapshot_at = unit.record.row_contract.get("snapshot_at")
+            result["logic_id"] = hashlib.sha256(f"{name}\n{snapshot_at}".encode()).hexdigest()
+        missing_fields = [
+            field for field in unit.target_fields if result.get(field) in (None, "")
+        ]
+        return result, {
+            "valid": not missing_fields,
+            "missing_fields": missing_fields,
+            "evidence_approved": False,
+            "human_correction": True,
+            "dataset_profile": profile,
+        }
+    if profile == TOP_LIST_AI_PROFILE:
+        result = dict(values)
+        name = str(result.get("company_name") or "").strip()
+        headquarter = str(result.get("headquarter_location") or "").strip()
+        ceo = str(result.get("CEO") or "").strip()
+        raw_funding = result.get("financing_amount")
+        if isinstance(raw_funding, str):
+            try:
+                raw_funding = float(raw_funding.strip())
+            except ValueError as exc:
+                raise ValueError("融资金额必须是以亿美元为单位的数值") from exc
+        if (
+            not name
+            or not headquarter
+            or not ceo
+            or not isinstance(raw_funding, int | float)
+            or isinstance(raw_funding, bool)
+            or raw_funding < 0
+        ):
+            raise ValueError("公司、总部、首席执行官和非负融资金额均为必填项")
+        try:
+            establish_date = int(result.get("establish_date"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("成立时间必须是有效年份") from exc
+        rank_year = int(unit.record.row_contract.get("rank_year") or 0)
+        if not 1800 <= establish_date <= rank_year:
+            raise ValueError("成立时间必须是不晚于榜单年度的有效年份")
+        deterministic = (unit.validation or {}).get("deterministic_profile_values") or {}
+        datasource_date = deterministic.get("datasource_date") or (unit.suggestion or {}).get(
+            "datasource_date"
+        )
+        if not datasource_date:
+            raise ValueError("福布斯官方发布时间缺失, 不能提交年度批次修正")
+        result.update(unit.record.row_contract.get("fixed_values") or {})
+        result.update(
+            {
+                "rank_year": rank_year,
+                "company_name": name,
+                "headquarter_location": headquarter,
+                "CEO": ceo,
+                "financing_amount": raw_funding,
+                "financing_amount_unit": "亿美元",
+                "source": "福布斯",
+                "source_url": FORBES_AI50_SOURCE_URL,
+                "update_frequency": "year",
+                "datasource_date": datasource_date,
+                "data_type": "采集",
+                "data_status": "新增",
+            }
+        )
+        normalized_name = " ".join(name.casefold().split())
+        result["logic_id"] = hashlib.sha256(
+            f"{rank_year}\n{normalized_name}".encode()
+        ).hexdigest()
+        missing_fields = [field for field in unit.target_fields if result.get(field) in (None, "")]
+        return result, {
+            "valid": not missing_fields,
+            "missing_fields": missing_fields,
+            "evidence_approved": False,
+            "human_correction": True,
+            "dataset_profile": profile,
+            "funding_conversion": {
+                "mode": "HUMAN_CONFIRMED_STANDARD_VALUE",
+                "target_unit": "亿美元",
+            },
+        }
+    if profile != "ai_index_v1":
+        validation = {
+            "valid": True,
+            "evidence_approved": False,
+            "human_correction": True,
+        }
+        return dict(values), validation
+
+    program_result = convert_unit(
+        values.get("be_data"),
+        values.get("be_unit"),
+        unit.record.row_contract.get("standard_unit"),
+    )
+    conversion = program_result
+    if program_result.status == ConversionStatus.UNSUPPORTED:
+        previous_conversion = (unit.validation or {}).get("conversion")
+        if isinstance(previous_conversion, dict):
+            conversion = model_fallback_conversion(
+                program_result=program_result,
+                verification={"conversion": previous_conversion},
+            ) or program_result
+    if conversion.status not in {ConversionStatus.CONVERTED, ConversionStatus.SAME_UNIT}:
+        raise ValueError(
+            "The corrected raw value/unit cannot be converted safely; reject for recollection or add a "
+            f"deterministic unit rule ({conversion.status}: {conversion.reason})"
+        )
+
+    result = {**values, "data": conversion.result}
+    valid_empty_fields = []
+    if (
+        conversion.normalized_source_unit == "无量纲"
+        and conversion.normalized_target_unit == "无量纲"
+    ):
+        valid_empty_fields.append("be_unit")
+    missing_fields = [
+        field
+        for field in unit.target_fields
+        if result.get(field) in (None, "") and field not in valid_empty_fields
+    ]
+    validation = {
+        "valid": not missing_fields,
+        "missing_fields": missing_fields,
+        "valid_empty_fields": valid_empty_fields,
+        "evidence_approved": False,
+        "human_correction": True,
+        "conversion": conversion.to_dict(),
+        "model_conversion_fallback": conversion.mode == "MODEL_FALLBACK",
+    }
+    return result, validation
+
+
 def review_unit(
     db: Session,
     *,
@@ -99,15 +262,17 @@ def review_unit(
         if values is None or set(values) != set(unit.target_fields):
             raise ValueError("Corrected values must contain every target field")
         final_values = _complete_review_source_url(db, unit, values)
+        final_values, correction_validation = _apply_review_conversion(unit, final_values)
         status, reason, risk = classify_resolution(
             execution_status=unit.status,
             target_fields=list(unit.target_fields),
             values=final_values,
-            validation={"valid": True, "evidence_approved": False},
+            validation=correction_validation,
         )
         unit.resolution_status = status
         unit.resolution_reason = "HUMAN_CORRECTION" if status == ResolutionStatus.RESOLVED else reason
         unit.risk_level = risk
+        unit.validation = correction_validation
         unit.validation_version = VALIDATION_VERSION
     elif decision == ReviewStatus.REJECTED:
         # 重采清除旧建议和错误，但历史证据与 ReviewDecision 仍保留用于审计。
@@ -203,7 +368,11 @@ def export_readiness(db: Session, task_id: str) -> dict[str, Any]:
         ResolutionStatus.UNRESOLVED,
         ResolutionStatus.CONFLICT,
     }
+    annual_profile_units = 0
     for unit in units:
+        annual_profile = unit.record.row_contract.get("profile") == TOP_LIST_AI_PROFILE
+        if annual_profile:
+            annual_profile_units += 1
         counts[unit.review_status] = counts.get(unit.review_status, 0) + 1
         blocker: str | None = None
         if unit.status != UnitStatus.SUCCEEDED:
@@ -220,8 +389,16 @@ def export_readiness(db: Session, task_id: str) -> dict[str, Any]:
             blocker = "NOT_EVALUATED"
         if unit.review_status == ReviewStatus.SKIPPED and unit.record.row_contract.get("optional") is True:
             blocker = None
+        # 年度名单只有完整 50 家都形成正式值时才能切换旧活动批次。确认未解决虽然可用于
+        # 普通表导出，但不能生成一份少公司的“Top 50”。
+        if annual_profile and unit.review_status not in approved:
+            blocker = "ANNUAL_COHORT_NOT_FULLY_APPROVED"
         if blocker:
             blocker_counts[blocker] = blocker_counts.get(blocker, 0) + 1
+    if annual_profile_units and annual_profile_units != TOP_LIST_AI_COUNT:
+        blocker_counts["ANNUAL_COHORT_SIZE_INVALID"] = abs(
+            TOP_LIST_AI_COUNT - annual_profile_units
+        ) or 1
     blockers = [{"code": code, "count": count} for code, count in sorted(blocker_counts.items())]
     return {
         "ready": not blockers,
@@ -252,9 +429,8 @@ def build_export(db: Session, task: CollectionTask, actor: User) -> ExportJob:
     db.add(job)
     db.flush()
     try:
-        updates = [
-            (unit.record.sheet_name, unit.record.source_row, unit.final_values or {})
-            for unit in db.scalars(
+        approved_units = list(
+            db.scalars(
                 select(CollectionUnit).where(
                     CollectionUnit.task_id == task.id,
                     CollectionUnit.review_status.in_(
@@ -262,7 +438,28 @@ def build_export(db: Session, task: CollectionTask, actor: User) -> ExportJob:
                     ),
                 )
             )
+        )
+        updates: list[tuple[str, int, dict[str, Any]]] = []
+        annual_units = [
+            unit
+            for unit in approved_units
+            if unit.record.row_contract.get("profile") == TOP_LIST_AI_PROFILE
         ]
+        if annual_units:
+            superseded = {
+                (unit.record.sheet_name, int(row_number))
+                for unit in annual_units
+                for row_number in unit.record.row_contract.get("superseded_rows", [])
+            }
+            # 旧批次状态切换和新批次追加位于同一次工作簿保存中，失败时不会留下半切换产物。
+            updates.extend(
+                (sheet_name, row_number, {"data_status": "删除"})
+                for sheet_name, row_number in sorted(superseded)
+            )
+        updates.extend(
+            (unit.record.sheet_name, unit.record.source_row, unit.final_values or {})
+            for unit in approved_units
+        )
         destination = export_path(f"{task.id}/{job.id}.xlsx")
         export_reviewed_workbook(FileObjectStore().path(file.object_key), destination, updates)
         key, digest = FileObjectStore().put_file(destination, namespace="exports", suffix=".xlsx")

@@ -34,6 +34,7 @@ from docx import Document
 from PIL import Image, ImageDraw, ImageOps
 
 from .config import get_settings
+from .forbes_ai50 import ForbesAI50Error, compact_forbes_ai50_html
 
 MAX_DOCUMENT_BYTES = 20_000_000
 MAX_DOCUMENT_CHARS = 80_000
@@ -131,6 +132,7 @@ class SourceDocument:
     cache_hit: bool = False
     persistent_cache_hit: bool = False
     normalized_url: str | None = None
+    cache_key: str | None = None
     content_hash: str | None = None
     parser_version: str = _PARSER_VERSION
 
@@ -182,7 +184,12 @@ def _persistent_cache_path(cache_key: str) -> Path:
     return get_settings().source_cache_root / digest[:2] / f"{digest}.json"
 
 
-def _load_persistent_document(cache_key: str, candidate: Any, index: int) -> SourceDocument | None:
+def _load_persistent_document(
+    cache_key: str,
+    candidate: Any,
+    index: int,
+    normalized_url: str,
+) -> SourceDocument | None:
     """读取未过期且解析器版本一致的跨任务缓存；损坏缓存按未命中处理。"""
 
     path = _persistent_cache_path(cache_key)
@@ -190,7 +197,8 @@ def _load_persistent_document(cache_key: str, candidate: Any, index: int) -> Sou
         payload = json.loads(path.read_text(encoding="utf-8"))
     except OSError, ValueError, TypeError:
         return None
-    if payload.get("parser_version") != _PARSER_VERSION or payload.get("normalized_url") != cache_key:
+    persisted_key = payload.get("cache_key", payload.get("normalized_url"))
+    if payload.get("parser_version") != _PARSER_VERSION or persisted_key != cache_key:
         return None
     cached_at = payload.get("cached_at")
     if not isinstance(cached_at, int | float) or (
@@ -199,7 +207,7 @@ def _load_persistent_document(cache_key: str, candidate: Any, index: int) -> Sou
         return None
     document = SourceDocument(
         index=index,
-        url=payload.get("final_url") or cache_key,
+        url=payload.get("final_url") or normalized_url,
         requested_url=candidate.source_url,
         title=candidate.title or payload.get("title"),
         snippet=candidate.excerpt or payload.get("snippet"),
@@ -210,7 +218,8 @@ def _load_persistent_document(cache_key: str, candidate: Any, index: int) -> Sou
         browser_fallback_reason=payload.get("browser_fallback_reason"),
         cache_hit=True,
         persistent_cache_hit=True,
-        normalized_url=cache_key,
+        normalized_url=payload.get("normalized_url") or normalized_url,
+        cache_key=cache_key,
         content_hash=payload.get("content_hash"),
     )
     return document if document.text else None
@@ -226,7 +235,8 @@ def _persist_document(cache_key: str, document: SourceDocument) -> None:
     payload = {
         "parser_version": _PARSER_VERSION,
         "cached_at": time.time(),
-        "normalized_url": cache_key,
+        "cache_key": cache_key,
+        "normalized_url": document.normalized_url,
         "final_url": document.url,
         "title": document.title,
         "snippet": document.snippet,
@@ -278,6 +288,10 @@ def looks_like_challenge_page(text: str) -> bool:
 
 def browser_fallback_reason(document: SourceDocument, *, min_content_chars: int) -> str | None:
     """判断是否需要浏览器重试，并返回可审计原因；附件类型不走浏览器。"""
+    if (urlparse(document.url).hostname or "").lower() == "api.github.com":
+        # 结构化 API 的限流或鉴权错误必须由 HTTP 重试处理；浏览器渲染既不能修复响应，也会
+        # 把错误页误当证据并显著拖慢固定榜单任务。
+        return None
     suffix = Path(urlparse(document.url).path).suffix.lower()
     if suffix in BROWSER_EXCLUDED_SUFFIXES:
         return None
@@ -297,6 +311,16 @@ def extract_html_main_content(data: bytes, base_url: str) -> tuple[str, list[tup
     """抽取网页主正文，并按尺寸、替代文本和噪声规则筛选最多两张相关图片。"""
 
     html_text = _decode_text(data)
+    # 福布斯列表页的完整 50 条数据位于 Next.js 内嵌状态而非首屏正文。先压缩为仅含业务字段
+    # 的官方快照，既避免丢失未首屏渲染的公司，也不会把几十万字符页面状态送入模型。
+    try:
+        forbes_snapshot = compact_forbes_ai50_html(html_text)
+    except ForbesAI50Error:
+        # 识别到 AI 50 页面却无法解析时保留空正文；调用方会失败关闭并重试，不能退回只含
+        # 少数首屏卡片的内容后误认为完整榜单。
+        forbes_snapshot = ""
+    if forbes_snapshot is not None:
+        return _normalize_text(forbes_snapshot), []
     extracted = trafilatura.extract(
         html_text,
         include_comments=False,
@@ -437,7 +461,17 @@ async def _download(
     """流式下载受限大小的公共资源，并再次校验重定向后的最终地址。"""
 
     await validate_url(url)
-    async with client.stream("GET", url, headers={"User-Agent": "MetricPulse/1.0"}) as response:
+    headers = {"User-Agent": "MetricPulse/1.0"}
+    if (urlparse(url).hostname or "").lower() == "api.github.com":
+        headers.update(
+            {
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+        )
+        if token := get_settings().github_api_token.strip():
+            headers["Authorization"] = f"Bearer {token}"
+    async with client.stream("GET", url, headers=headers) as response:
         response.raise_for_status()
         final_url = str(response.url)
         await validate_url(final_url)
@@ -525,7 +559,12 @@ async def fetch_source_document(
             converted = normalize_image(data)
             if converted:
                 document.images = [ImageEvidence(f"Source {index}, image", converted, index)]
-        elif media_type.startswith("text/") or suffix in {".csv", ".tsv", ".json", ".xml"}:
+        elif (
+            media_type.startswith("text/")
+            or media_type == "application/json"
+            or media_type.endswith("+json")
+            or suffix in {".csv", ".tsv", ".json", ".xml"}
+        ):
             document.text = _normalize_text(_decode_text(data))
         else:
             document.error = f"unsupported content type: {media_type or suffix or 'unknown'}"
@@ -737,7 +776,16 @@ async def gather_source_documents(
     async with httpx.AsyncClient(follow_redirects=True, timeout=25) as client:
 
         async def guarded(candidate: Any, index: int) -> SourceDocument:
-            cache_key = normalize_source_url(candidate.source_url)
+            normalized_url = normalize_source_url(candidate.source_url)
+            metadata = getattr(candidate, "metadata", {})
+            cache_scope = metadata.get("cache_scope") if isinstance(metadata, dict) else None
+            # 动态榜单按任务快照隔离缓存：同一次十行复用一份正文，新任务即使在普通缓存
+            # TTL 内也会重新读取当前榜单。scope 只参与内部缓存键，不发送给来源网站。
+            cache_key = (
+                f"{normalized_url}\ncache-scope:{cache_scope}"
+                if cache_scope not in (None, "")
+                else normalized_url
+            )
             cached = _SOURCE_CACHE.get(cache_key)
             if cached is not None:
                 return _cached_document(cached, candidate, index)
@@ -746,7 +794,12 @@ async def gather_source_documents(
                 cached = _SOURCE_CACHE.get(cache_key)
                 if cached is not None:
                     return _cached_document(cached, candidate, index)
-                persistent = _load_persistent_document(cache_key, candidate, index)
+                persistent = _load_persistent_document(
+                    cache_key,
+                    candidate,
+                    index,
+                    normalized_url,
+                )
                 if persistent is not None:
                     if len(_SOURCE_CACHE) >= _SOURCE_CACHE_MAX_ITEMS:
                         _SOURCE_CACHE.pop(next(iter(_SOURCE_CACHE)))
@@ -754,15 +807,16 @@ async def gather_source_documents(
                     return persistent
                 async with semaphore:
                     normalized_candidate = copy.copy(candidate)
-                    normalized_candidate.source_url = cache_key
+                    normalized_candidate.source_url = normalized_url
                     document = await fetch_source_document(
                         normalized_candidate,
                         index,
                         client,
                         validate_url,
                     )
-                    document.requested_url = candidate.source_url
-                    document.normalized_url = cache_key
+                document.requested_url = candidate.source_url
+                document.normalized_url = normalized_url
+                document.cache_key = cache_key
                 if not document.error and (document.text or document.images):
                     if len(_SOURCE_CACHE) >= _SOURCE_CACHE_MAX_ITEMS:
                         _SOURCE_CACHE.pop(next(iter(_SOURCE_CACHE)))
@@ -785,7 +839,7 @@ async def gather_source_documents(
                 site_cooldown_seconds=browser_site_cooldown_seconds,
             )
         for document in documents:
-            cache_key = document.normalized_url or normalize_source_url(
+            cache_key = document.cache_key or document.normalized_url or normalize_source_url(
                 document.requested_url or document.url
             )
             if not document.error and document.text:

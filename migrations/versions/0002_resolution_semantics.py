@@ -23,6 +23,13 @@ def _json(value: object) -> object:
 
 
 def upgrade() -> None:
+    # 0001 historically used current ORM metadata. A brand-new database therefore already contains
+    # later columns; keep the historical migration usable for old databases while making fresh upgrade
+    # idempotent until 0001 is replaced by a frozen baseline.
+    if "resolution_status" in {
+        column["name"] for column in sa.inspect(op.get_bind()).get_columns("collection_units")
+    }:
+        return
     op.add_column(
         "collection_units",
         sa.Column("resolution_status", sa.String(40), nullable=False, server_default="NOT_EVALUATED"),

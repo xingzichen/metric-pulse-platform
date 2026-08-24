@@ -67,6 +67,7 @@ const definitions: Record<string, { label: string; tone: StatusTone }> = {
   DIRECT_LINK: { label: "采集链接直取", tone: "success" },
   SEARCH_FALLBACK: { label: "搜索降级", tone: "warning" },
   UNIQUE_MATCH: { label: "唯一匹配", tone: "success" },
+  OFFICIAL_ANNUAL_POSITION_MATCH: { label: "官方年度名单匹配", tone: "success" },
   AMBIGUOUS_MATCH: { label: "多条匹配", tone: "danger" },
   TARGET_NOT_FOUND: { label: "未匹配到数据", tone: "warning" },
   UNSTRUCTURED_RELEVANT: { label: "正文相关", tone: "info" },
@@ -75,6 +76,19 @@ const definitions: Record<string, { label: string; tone: StatusTone }> = {
   FETCH_FAILED: { label: "获取失败", tone: "danger" },
   NO_MATCH_KEYS: { label: "缺少匹配字段", tone: "warning" },
   PARSE_FAILED: { label: "解析失败", tone: "danger" },
+  MATCHED: { label: "匹配通过", tone: "success" },
+  UNMATCHED: { label: "未匹配", tone: "danger" },
+  DETERMINISTIC: { label: "程序换算", tone: "success" },
+  MODEL_FALLBACK: { label: "模型降级换算", tone: "warning" },
+  NONE: { label: "未执行换算", tone: "neutral" },
+  CONVERTED: { label: "已完成换算", tone: "success" },
+  SAME_UNIT: { label: "无需变换单位", tone: "success" },
+  UNSUPPORTED: { label: "程序规则未覆盖", tone: "warning" },
+  MISSING_SOURCE_UNIT: { label: "缺少来源单位", tone: "warning" },
+  MISSING_TARGET_UNIT: { label: "缺少标准单位", tone: "warning" },
+  NON_NUMERIC: { label: "原始值不是数值", tone: "danger" },
+  DIMENSION_MISMATCH: { label: "单位维度不一致", tone: "danger" },
+  INVALID_RESULT: { label: "换算结果无效", tone: "danger" },
 };
 
 export function getStatusPresentation(
@@ -103,6 +117,8 @@ const reasonLabels: Record<string, string> = {
   TARGET_NOT_FOUND: "采集链接中未找到对应数据",
   AMBIGUOUS_MATCH: "采集链接中存在多条匹配数据",
   DIRECT_SOURCE_INCOMPLETE: "采集链接中的目标字段不完整",
+  UNIT_CONVERSION_INVALID: "单位换算无效",
+  RAW_OBSERVATION_INCOMPLETE: "来源原始值或单位不完整",
 };
 
 const blockerLabels: Record<string, string> = {
@@ -111,6 +127,8 @@ const blockerLabels: Record<string, string> = {
   UNRESOLVED_NOT_CONFIRMED: "未解决项尚未人工确认",
   INVALID: "存在无效结果",
   NOT_EVALUATED: "存在未评估结果",
+  ANNUAL_COHORT_NOT_FULLY_APPROVED: "年度 Top 50 尚未全部形成正式结果",
+  ANNUAL_COHORT_SIZE_INVALID: "年度 Top 50 批次数量不完整",
 };
 
 export function getReasonLabel(value?: string | null) {

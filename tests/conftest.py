@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 from collections.abc import Generator
@@ -31,6 +32,12 @@ from fastapi.testclient import TestClient  # noqa: E402
 from metric_pulse import main as main_module  # noqa: E402
 from metric_pulse import processor as processor_module  # noqa: E402
 from metric_pulse.collector import CollectionResult, EvidenceItem  # noqa: E402
+from metric_pulse.dataset_profiles import (  # noqa: E402
+    AI_ALGORITHM_COLLECTION_PROFILE,
+    FORBES_AI50_SOURCE_URL,
+    GITHUB_TOP_REPOSITORIES_SOURCE_URL,
+    TOP_LIST_AI_PROFILE,
+)
 from metric_pulse.db import Base, SessionLocal, engine  # noqa: E402
 from metric_pulse.main import app  # noqa: E402
 from metric_pulse.security import bootstrap_admin  # noqa: E402
@@ -53,6 +60,76 @@ class FixtureWorkbookCollector:
             }
 
     async def collect(self, record, unit) -> CollectionResult:
+        if record.row_contract.get("profile") == AI_ALGORITHM_COLLECTION_PROFILE:
+            rank = int(record.row_contract["rank"])
+            name = f"fixture/repository-{rank}"
+            snapshot_at = record.row_contract["snapshot_at"]
+            values = dict.fromkeys(unit.target_fields)
+            values.update(record.row_contract["fixed_values"])
+            values.update(
+                {
+                    "logic_id": hashlib.sha256(f"{name}\n{snapshot_at}".encode()).hexdigest(),
+                    "name": name,
+                    "star": 1_001 - rank,
+                    "source_url": GITHUB_TOP_REPOSITORIES_SOURCE_URL,
+                }
+            )
+            return CollectionResult(
+                values=values,
+                evidence=[
+                    EvidenceItem(
+                        source_url=GITHUB_TOP_REPOSITORIES_SOURCE_URL,
+                        title="GitHub repository search fixture",
+                        metadata={"provider": "test-source-fixture", "selected": True},
+                    )
+                ],
+                validation={"valid": True, "source_fixture": True},
+                model="test-fixture",
+            )
+        if record.row_contract.get("profile") == TOP_LIST_AI_PROFILE:
+            position = int(record.row_contract["list_position"])
+            rank_year = int(record.row_contract["rank_year"])
+            name = f"Fixture AI Company {position:02d}"
+            normalized_name = " ".join(name.casefold().split())
+            values = dict.fromkeys(unit.target_fields)
+            values.update(record.row_contract["fixed_values"])
+            values.update(
+                {
+                    "logic_id": hashlib.sha256(
+                        f"{rank_year}\n{normalized_name}".encode()
+                    ).hexdigest(),
+                    "rank_year": rank_year,
+                    "company_name": name,
+                    "headquarter_location": f"测试总部 {position}",
+                    "CEO": f"Test CEO {position}",
+                    "financing_amount": position / 10,
+                    "financing_amount_unit": "亿美元",
+                    "establish_date": 2000 + position % 20,
+                    "source": "福布斯",
+                    "source_url": FORBES_AI50_SOURCE_URL,
+                    "update_frequency": "year",
+                    "datasource_date": f"{rank_year}-04-16T06:30:00-04:00",
+                    "collection_date": record.row_contract["snapshot_at"],
+                    "data_type": "采集",
+                    "data_status": "新增",
+                }
+            )
+            return CollectionResult(
+                values=values,
+                evidence=[
+                    EvidenceItem(
+                        source_url=FORBES_AI50_SOURCE_URL,
+                        title="Forbes official AI 50 fixture",
+                        metadata={"provider": "test-source-fixture", "selected": True},
+                    )
+                ],
+                validation={
+                    "valid": True,
+                    "source_fixture": True,
+                    "dataset_profile": TOP_LIST_AI_PROFILE,
+                },
+                model="test-fixture",
+            )
         sheet = self.workbook[record.sheet_name]
         columns = self.columns[record.sheet_name]
         values = {

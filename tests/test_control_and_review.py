@@ -8,6 +8,14 @@ from sqlalchemy import select
 
 from metric_pulse import main as main_module
 from metric_pulse.collector import CollectionResult, EvidenceItem
+from metric_pulse.dataset_profiles import (
+    AI_ALGORITHM_COLLECTION_TARGET_FIELDS,
+    FORBES_AI50_SOURCE_URL,
+    GITHUB_TOP_REPOSITORIES_SOURCE_URL,
+    TOP_LIST_AI_TARGET_FIELDS,
+    ai_algorithm_collection_row_contract,
+    top_list_ai_row_contract,
+)
 from metric_pulse.db import SessionLocal
 from metric_pulse.models import (
     CollectionTask,
@@ -209,6 +217,202 @@ def test_human_correction_autofills_one_selected_evidence_url(client) -> None:
         "source_url": "https://example.com/supporting-attachment.pdf",
     }
     assert unit.resolution_status == ResolutionStatus.RESOLVED
+    db.close()
+
+
+def test_ai_index_human_correction_recomputes_data_deterministically(client) -> None:
+    db, user, _, unit = _task_with_unit(
+        task_status=TaskStatus.SUCCEEDED,
+        unit_status=UnitStatus.SUCCEEDED,
+    )
+    unit.target_fields = ["be_data", "be_unit", "data"]
+    unit.record.row_contract = {
+        "profile": "ai_index_v1",
+        "standard_unit": "亿美元",
+    }
+    unit.suggestion = {"be_data": 500, "be_unit": "百万美元", "data": 5}
+    unit.resolution_status = ResolutionStatus.RESOLVED
+    db.commit()
+
+    review_unit(
+        db,
+        unit=unit,
+        actor=user,
+        decision=ReviewStatus.CORRECTED,
+        expected_version=unit.version,
+        values={"be_data": "600", "be_unit": "百万美元", "data": 999},
+    )
+
+    assert unit.final_values == {
+        "be_data": "600",
+        "be_unit": "百万美元",
+        "data": 6,
+    }
+    assert unit.validation["conversion"]["mode"] == "DETERMINISTIC"
+    assert unit.validation["conversion"]["factor"] == "0.01"
+    assert unit.resolution_status == ResolutionStatus.RESOLVED
+    db.close()
+
+
+def test_algorithm_collection_correction_preserves_application_owned_fields(client) -> None:
+    db, user, _, unit = _task_with_unit(
+        task_status=TaskStatus.SUCCEEDED,
+        unit_status=UnitStatus.SUCCEEDED,
+    )
+    snapshot_at = "2026-08-24T21:30:00+08:00"
+    raw_data, contract, target_fields = ai_algorithm_collection_row_contract(
+        sheet_name="人工智能算法收藏(ai_algorithm_collectio",
+        source_row=4,
+        rank=1,
+        snapshot_at=snapshot_at,
+        headers=list(AI_ALGORITHM_COLLECTION_TARGET_FIELDS),
+    )
+    unit.target_fields = target_fields
+    unit.record.raw_data = raw_data
+    unit.record.row_contract = contract
+    unit.suggestion = {
+        **dict.fromkeys(target_fields),
+        **contract["fixed_values"],
+        "logic_id": "a" * 64,
+        "name": "owner/original",
+        "star": 999,
+        "source_url": GITHUB_TOP_REPOSITORIES_SOURCE_URL,
+    }
+    unit.resolution_status = ResolutionStatus.RESOLVED
+    db.commit()
+    correction = {
+        **unit.suggestion,
+        "name": "owner/corrected",
+        "star": "1001",
+        "rank": 99,
+        "source_url": "https://example.com/forged",
+        "source_department": "Other",
+        "collect_date": "2000-01-01",
+    }
+
+    review_unit(
+        db,
+        unit=unit,
+        actor=user,
+        decision=ReviewStatus.CORRECTED,
+        expected_version=unit.version,
+        values=correction,
+    )
+
+    assert unit.final_values["name"] == "owner/corrected"
+    assert unit.final_values["star"] == 1001
+    assert unit.final_values["rank"] == 1
+    assert unit.final_values["source_url"] == GITHUB_TOP_REPOSITORIES_SOURCE_URL
+    assert unit.final_values["source_department"] == "Github"
+    assert unit.final_values["collect_date"] == snapshot_at
+    assert unit.final_values["datasource_date"] == snapshot_at
+    assert unit.final_values["collection_date"] == snapshot_at
+    assert len(unit.final_values["logic_id"]) == 64
+    assert unit.validation["human_correction"] is True
+    db.close()
+
+
+def test_forbes_ai50_correction_preserves_official_batch_fields(client) -> None:
+    db, user, _, unit = _task_with_unit(
+        task_status=TaskStatus.SUCCEEDED,
+        unit_status=UnitStatus.SUCCEEDED,
+    )
+    snapshot_at = "2026-08-24T22:30:00+08:00"
+    headers = [*TOP_LIST_AI_TARGET_FIELDS, "update_time", "created_time"]
+    raw_data, contract, target_fields = top_list_ai_row_contract(
+        sheet_name="TOP50企业排名(top_list_ai)",
+        source_row=203,
+        list_position=1,
+        snapshot_at=snapshot_at,
+        rank_year=2026,
+        headers=headers,
+        superseded_rows=list(range(153, 203)),
+    )
+    datasource_date = "2026-04-16T06:30:00-04:00"
+    unit.target_fields = target_fields
+    unit.record.raw_data = raw_data
+    unit.record.row_contract = contract
+    unit.suggestion = {
+        **dict.fromkeys(target_fields),
+        **contract["fixed_values"],
+        "logic_id": "a" * 64,
+        "company_name": "Original Company",
+        "headquarter_location": "美国旧金山",
+        "CEO": "Original CEO",
+        "financing_amount": 3.92,
+        "establish_date": 2020,
+        "source_url": FORBES_AI50_SOURCE_URL,
+        "datasource_date": datasource_date,
+    }
+    unit.validation = {
+        "deterministic_profile_values": {"datasource_date": datasource_date}
+    }
+    unit.resolution_status = ResolutionStatus.RESOLVED
+    db.commit()
+    correction = {
+        **unit.suggestion,
+        "company_name": "Corrected Company",
+        "headquarter_location": "美国加利福尼亚州旧金山",
+        "CEO": "Corrected CEO",
+        "financing_amount": "4.58",
+        "establish_date": "2021",
+        "rank_year": 1999,
+        "financing_amount_unit": "美元",
+        "source": "转载网站",
+        "source_url": "https://example.com/forged",
+        "datasource_date": "2000-01-01",
+        "collection_date": "2000-01-01",
+        "data_status": "删除",
+    }
+
+    review_unit(
+        db,
+        unit=unit,
+        actor=user,
+        decision=ReviewStatus.CORRECTED,
+        expected_version=unit.version,
+        values=correction,
+    )
+
+    assert unit.final_values["company_name"] == "Corrected Company"
+    assert unit.final_values["headquarter_location"] == "美国加利福尼亚州旧金山"
+    assert unit.final_values["CEO"] == "Corrected CEO"
+    assert unit.final_values["financing_amount"] == 4.58
+    assert unit.final_values["financing_amount_unit"] == "亿美元"
+    assert unit.final_values["rank_year"] == 2026
+    assert unit.final_values["source"] == "福布斯"
+    assert unit.final_values["source_url"] == FORBES_AI50_SOURCE_URL
+    assert unit.final_values["datasource_date"] == datasource_date
+    assert unit.final_values["collection_date"] == snapshot_at
+    assert unit.final_values["data_status"] == "新增"
+    assert len(unit.final_values["logic_id"]) == 64
+    assert unit.validation["human_correction"] is True
+    db.close()
+
+
+def test_ai_index_human_correction_rejects_dimension_mismatch(client) -> None:
+    db, user, _, unit = _task_with_unit(
+        task_status=TaskStatus.SUCCEEDED,
+        unit_status=UnitStatus.SUCCEEDED,
+    )
+    unit.target_fields = ["be_data", "be_unit", "data"]
+    unit.record.row_contract = {
+        "profile": "ai_index_v1",
+        "standard_unit": "EFlops",
+    }
+    unit.suggestion = {"be_data": 12, "be_unit": "亿美元", "data": None}
+    unit.resolution_status = ResolutionStatus.INVALID
+    db.commit()
+
+    with pytest.raises(ValueError, match="DIMENSION_MISMATCH"):
+        review_unit(
+            db,
+            unit=unit,
+            actor=user,
+            decision=ReviewStatus.CORRECTED,
+            expected_version=unit.version,
+            values={"be_data": 12, "be_unit": "亿美元", "data": 12},
+        )
     db.close()
 
 

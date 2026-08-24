@@ -28,6 +28,30 @@ async function recognize() {
 function selectSheet(value: string | number) {
   active.value = String(value);
 }
+function isExcluded(sheet?: Sheet) {
+  return sheet?.profile.excluded === true;
+}
+function exclusionLabel(sheet?: Sheet) {
+  const reason = sheet?.profile.exclusionReason;
+  if (reason && typeof reason === "object" && "label" in reason) {
+    return String(reason.label);
+  }
+  return "不由本平台处理";
+}
+function modeLabel(value: unknown) {
+  const labels: Record<string, string> = {
+    row_contract_collect: "已有行补全",
+    snapshot_build: "完整快照构建",
+    monthly_top10_append: "月度前十增量",
+    annual_top50_append: "年度五十家增量",
+    excluded: "不由本平台处理",
+  };
+  const key = String(value || "");
+  return labels[key] || key || "—";
+}
+function fieldsLabel(fields: string[], emptyLabel = "—") {
+  return fields.length ? fields.join("、") : emptyLabel;
+}
 </script>
 <template>
   <div v-if="query.data.value">
@@ -55,7 +79,13 @@ function selectSheet(value: string | number) {
             :key="sheet.id"
             :index="sheet.name"
             ><span>{{ sheet.name }}</span
-            ><el-tag size="small" style="margin-left: auto"
+            ><el-tag
+              v-if="isExcluded(sheet)"
+              size="small"
+              type="info"
+              style="margin-left: auto"
+              >{{ exclusionLabel(sheet) }}</el-tag
+            ><el-tag v-else size="small" style="margin-left: auto"
               >{{ Math.round(sheet.confidence * 100) }}%</el-tag
             ></el-menu-item
           ></el-menu
@@ -71,18 +101,28 @@ function selectSheet(value: string | number) {
             object-fit: contain;
             border: 1px solid #eee;
           "
+        /><el-alert
+          v-if="isExcluded(selected)"
+          :title="`该工作表${exclusionLabel(selected)}，本平台不会规划、采集或写回`"
+          type="info"
+          :closable="false"
+          show-icon
+          style="margin-top: 16px"
         /><el-descriptions :column="1" border style="margin-top: 16px"
           ><el-descriptions-item label="描述字段">{{
-            selected.descriptorFields.join("、")
+            fieldsLabel(selected.descriptorFields)
           }}</el-descriptions-item
           ><el-descriptions-item label="待采集字段">{{
-            selected.targetFields.join("、")
+            fieldsLabel(
+              selected.targetFields,
+              isExcluded(selected) ? "不由本平台采集" : "—",
+            )
           }}</el-descriptions-item
           ><el-descriptions-item label="业务键">{{
-            selected.businessKeyFields.join("、")
+            fieldsLabel(selected.businessKeyFields)
           }}</el-descriptions-item
           ><el-descriptions-item label="模式">{{
-            String(selected.profile.mode || "")
+            modeLabel(selected.profile.mode)
           }}</el-descriptions-item></el-descriptions
         ></el-card
       >

@@ -11,10 +11,23 @@ import hashlib
 import json
 from datetime import UTC, datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from .dataset_profiles import (
+    AI_ALGORITHM_COLLECTION_TOP_N,
+    TOP_LIST_AI_COUNT,
+    ai_algorithm_collection_row_contract,
+    ai_index_row_contract,
+    ai_index_unit_targets,
+    excluded_sheet_policy,
+    is_ai_algorithm_collection_sheet,
+    is_ai_index_sheet,
+    is_top_list_ai_sheet,
+    top_list_ai_row_contract,
+)
 from .models import (
     AuditLog,
     CollectionTask,
@@ -30,7 +43,7 @@ from .models import (
 )
 from .state_machine import ensure_transition
 from .storage import FileObjectStore
-from .workbook import read_rows
+from .workbook import allocate_blank_rows, read_rows, top_list_ai_batch_state
 
 COMPLETED_REVIEW_STATUSES = {
     ReviewStatus.AUTO_APPROVED,
@@ -96,6 +109,17 @@ def plan_task(db: Session, task: CollectionTask) -> dict[str, int]:
     source = FileObjectStore().path(file.object_key)
     selections = task.config.get("datasets", [])
     analysis_by_name = {sheet["name"]: sheet for sheet in file.analysis["sheets"]}
+    # 在创建任何记录之前完成范围预检。即使调用方绕过前端并手工提交目标字段，排除表也不能
+    # 进入规划；预检前置还能避免混合配置在报错前留下部分 flush 的单元。
+    for selection in selections:
+        selected_sheet = analysis_by_name.get(selection["sheet_name"])
+        if not selected_sheet:
+            raise ValueError(f"Unknown sheet {selection['sheet_name']!r}")
+        exclusion = excluded_sheet_policy(selected_sheet["name"])
+        if exclusion:
+            raise ValueError(
+                f"工作表 {selected_sheet['name']!r} 不由本平台处理: {exclusion['label']}"
+            )
     records_created = 0
     units_created = 0
     for selection in selections:
@@ -103,30 +127,147 @@ def plan_task(db: Session, task: CollectionTask) -> dict[str, int]:
         if not sheet:
             raise ValueError(f"Unknown sheet {selection['sheet_name']!r}")
         headers = sheet["headers"]
+        ai_index = is_ai_index_sheet(sheet["name"], headers)
+        ai_algorithm_collection = is_ai_algorithm_collection_sheet(sheet["name"], headers)
+        top_list_ai = is_top_list_ai_sheet(sheet["name"], headers)
         target_fields = [field for field in selection["target_fields"] if field in headers]
         descriptor_fields = [field for field in selection["descriptor_fields"] if field in headers]
         key_fields = [field for field in selection["business_key_fields"] if field in headers]
         mode = selection.get("mode", "row_contract_collect")
+        if ai_algorithm_collection:
+            # 月度榜单不是“补现有一行”，而是在同一快照时间下预分配十个独立名次。来源正文
+            # 后续只获取一次并缓存，但每个名次仍生成独立 RowContract 和双模型核验单元。
+            snapshot_at = datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")
+            output_rows = allocate_blank_rows(
+                source,
+                sheet_name=sheet["name"],
+                header_row=sheet["header_row"],
+                column_count=len(headers),
+                count=AI_ALGORITHM_COLLECTION_TOP_N,
+            )
+            for rank, source_row in enumerate(output_rows, start=1):
+                raw_data, contract, profile_targets = ai_algorithm_collection_row_contract(
+                    sheet_name=sheet["name"],
+                    source_row=source_row,
+                    rank=rank,
+                    snapshot_at=snapshot_at,
+                    headers=headers,
+                )
+                record = DataRecord(
+                    task_id=task.id,
+                    sheet_name=sheet["name"],
+                    source_row=source_row,
+                    business_key=business_key(
+                        sheet["name"],
+                        {"snapshot_at": snapshot_at, "rank": rank},
+                        ["snapshot_at", "rank"],
+                        source_row,
+                    ),
+                    raw_data=raw_data,
+                    row_contract=contract,
+                )
+                db.add(record)
+                db.flush()
+                db.add(
+                    CollectionUnit(
+                        task_id=task.id,
+                        record_id=record.id,
+                        run_version=task.run_version,
+                        target_fields=profile_targets,
+                    )
+                )
+                records_created += 1
+                units_created += 1
+            continue
+        if top_list_ai:
+            # 福布斯 AI 50 是年度增量名单。任务规划只冻结当前年份、采集时间和 50 个内部
+            # 页面位置；公司事实必须在执行时从同一次官方快照获得，不能从模板历史值推断。
+            snapshot_at = datetime.now(ZoneInfo("Asia/Shanghai")).isoformat(timespec="seconds")
+            rank_year = datetime.fromisoformat(snapshot_at).year
+            batch_state = top_list_ai_batch_state(
+                source,
+                sheet_name=sheet["name"],
+                header_row=sheet["header_row"],
+                headers=headers,
+                rank_year=rank_year,
+            )
+            if batch_state["idempotent"]:
+                continue
+            output_rows = allocate_blank_rows(
+                source,
+                sheet_name=sheet["name"],
+                header_row=sheet["header_row"],
+                column_count=len(headers),
+                count=TOP_LIST_AI_COUNT,
+            )
+            for list_position, source_row in enumerate(output_rows, start=1):
+                raw_data, contract, profile_targets = top_list_ai_row_contract(
+                    sheet_name=sheet["name"],
+                    source_row=source_row,
+                    list_position=list_position,
+                    snapshot_at=snapshot_at,
+                    rank_year=rank_year,
+                    headers=headers,
+                    superseded_rows=batch_state["superseded_rows"],
+                )
+                record = DataRecord(
+                    task_id=task.id,
+                    sheet_name=sheet["name"],
+                    source_row=source_row,
+                    business_key=business_key(
+                        sheet["name"],
+                        {"rank_year": rank_year, "list_position": list_position},
+                        ["rank_year", "list_position"],
+                        source_row,
+                    ),
+                    raw_data=raw_data,
+                    row_contract=contract,
+                )
+                db.add(record)
+                db.flush()
+                db.add(
+                    CollectionUnit(
+                        task_id=task.id,
+                        record_id=record.id,
+                        run_version=task.run_version,
+                        target_fields=profile_targets,
+                    )
+                )
+                records_created += 1
+                units_created += 1
+            continue
         for source_row, raw_data in read_rows(
             source,
             sheet_name=sheet["name"],
             header_row=sheet["header_row"],
             headers=headers,
         ):
-            if mode == "snapshot_build":
+            if ai_index:
+                # 原始单位必须由当次来源重新观察，即使表内存在历史提示也不能跳过。
+                missing = ai_index_unit_targets(raw_data, headers)
+            elif mode == "snapshot_build":
                 raw_data = {**raw_data, **dict.fromkeys(target_fields)}
                 missing = target_fields
             else:
                 missing = [field for field in target_fields if raw_data.get(field) in (None, "")]
             if not missing:
                 continue
-            contract = {
-                "sheet_name": sheet["name"],
-                "source_row": source_row,
-                "descriptors": {field: raw_data.get(field) for field in descriptor_fields},
-                "target_fields": target_fields,
-                "mode": mode,
-            }
+            contract = (
+                ai_index_row_contract(
+                    sheet_name=sheet["name"],
+                    source_row=source_row,
+                    raw_data=raw_data,
+                    headers=headers,
+                )
+                if ai_index
+                else {
+                    "sheet_name": sheet["name"],
+                    "source_row": source_row,
+                    "descriptors": {field: raw_data.get(field) for field in descriptor_fields},
+                    "target_fields": target_fields,
+                    "mode": mode,
+                }
+            )
             record = DataRecord(
                 task_id=task.id,
                 sheet_name=sheet["name"],

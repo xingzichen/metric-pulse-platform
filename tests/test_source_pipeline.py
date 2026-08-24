@@ -108,10 +108,17 @@ def test_browser_fallback_targets_blocked_or_javascript_thin_pages() -> None:
         http_status=403,
         error="HTTP 403: Forbidden",
     )
+    github_api = SourceDocument(
+        index=4,
+        url="https://api.github.com/search/repositories?q=stars",
+        http_status=429,
+        error="HTTP 429: Too Many Requests",
+    )
 
     assert browser_fallback_reason(blocked, min_content_chars=500) == "HTTP 403"
     assert "shorter than 500" in (browser_fallback_reason(thin, min_content_chars=500) or "")
     assert browser_fallback_reason(binary, min_content_chars=500) is None
+    assert browser_fallback_reason(github_api, min_content_chars=500) is None
 
 
 def test_challenge_detection_does_not_flag_long_normal_article() -> None:
@@ -172,3 +179,56 @@ def test_source_document_cache_survives_memory_cache_clear(monkeypatch, tmp_path
     assert first[0].persistent_cache_hit is False
     assert second[0].persistent_cache_hit is True
     assert second[0].text == first[0].text
+
+
+def test_dynamic_snapshot_cache_is_reused_within_scope_but_refetched_for_new_scope(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    import asyncio
+
+    import metric_pulse.source_pipeline as pipeline
+
+    pipeline._SOURCE_CACHE.clear()
+    pipeline._SOURCE_CACHE_LOCKS.clear()
+    monkeypatch.setattr(pipeline.get_settings(), "source_cache_root", tmp_path)
+    fetches = 0
+
+    async def fake_fetch(candidate, index, client, validate_url):
+        nonlocal fetches
+        fetches += 1
+        return SourceDocument(
+            index=index,
+            url=candidate.source_url,
+            requested_url=candidate.source_url,
+            normalized_url=candidate.source_url,
+            media_type="application/json",
+            text=f'{{"fetch": {fetches}}}',
+        )
+
+    async def allow(_url):
+        return None
+
+    monkeypatch.setattr(pipeline, "fetch_source_document", fake_fetch)
+
+    def candidate(scope: str):
+        return SimpleNamespace(
+            source_url="https://api.github.com/search/repositories?q=stars",
+            title="Ranking",
+            excerpt=None,
+            metadata={"cache_scope": scope},
+        )
+
+    first = asyncio.run(gather_source_documents([candidate("snapshot-a")], allow))
+    same_snapshot = asyncio.run(gather_source_documents([candidate("snapshot-a")], allow))
+    new_snapshot = asyncio.run(gather_source_documents([candidate("snapshot-b")], allow))
+
+    assert fetches == 2
+    assert same_snapshot[0].cache_hit is True
+    assert first[0].text == same_snapshot[0].text
+    assert new_snapshot[0].text != first[0].text
+    assert all(
+        document.normalized_url
+        == "https://api.github.com/search/repositories?q=stars"
+        for document in (first[0], same_snapshot[0], new_snapshot[0])
+    )

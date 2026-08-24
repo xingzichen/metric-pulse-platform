@@ -22,6 +22,18 @@ from openpyxl.styles.numbers import is_date_format
 from openpyxl.utils import get_column_letter
 from PIL import Image, ImageDraw, ImageFont
 
+from .dataset_profiles import (
+    FORBES_AI50_SOURCE_URL,
+    TOP_LIST_AI_COUNT,
+    ai_algorithm_collection_analysis_fields,
+    ai_index_analysis_fields,
+    excluded_sheet_policy,
+    is_ai_algorithm_collection_sheet,
+    is_ai_index_sheet,
+    is_top_list_ai_sheet,
+    top_list_ai_analysis_fields,
+)
+
 MACHINE_HEADER = re.compile(r"^[A-Za-z][A-Za-z0-9_]{1,80}$")
 AUDIT_FIELDS = {
     "logic_id",
@@ -197,16 +209,47 @@ def analyze_workbook(path: Path) -> dict[str, Any]:
         ]
         stats = _field_stats(ws, header_row, headers)
         descriptors, targets, business_keys = _suggest_fields(headers, stats)
+        exclusion = excluded_sheet_policy(ws.title)
+        # 排除清单和专用数据集的字段角色都是业务契约，不能被抽样空值率重新推断。
+        if exclusion:
+            descriptors = []
+            targets = []
+            business_keys = []
+        elif is_ai_index_sheet(ws.title, headers):
+            profile_fields = ai_index_analysis_fields(headers)
+            descriptors = profile_fields["descriptor_fields"]
+            targets = profile_fields["target_fields"]
+            business_keys = profile_fields["business_key_fields"]
+        elif is_ai_algorithm_collection_sheet(ws.title, headers):
+            profile_fields = ai_algorithm_collection_analysis_fields(headers)
+            descriptors = profile_fields["descriptor_fields"]
+            targets = profile_fields["target_fields"]
+            business_keys = profile_fields["business_key_fields"]
+        elif is_top_list_ai_sheet(ws.title, headers):
+            profile_fields = top_list_ai_analysis_fields(headers)
+            descriptors = profile_fields["descriptor_fields"]
+            targets = profile_fields["target_fields"]
+            business_keys = profile_fields["business_key_fields"]
         data_rows = 0
         for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
             if any(not is_blank(value) for value in row):
                 data_rows += 1
         mode = "snapshot_build" if data_rows <= 1 else "row_contract_collect"
+        if exclusion:
+            mode = "excluded"
+        elif is_ai_algorithm_collection_sheet(ws.title, headers):
+            mode = "monthly_top10_append"
+        elif is_top_list_ai_sheet(ws.title, headers):
+            mode = "annual_top50_append"
         has_machine_headers = sum(bool(MACHINE_HEADER.fullmatch(h)) for h in headers) >= max(
             2, len(headers) // 3
         )
-        confidence = 0.96 if has_machine_headers and "logic_id" in headers else 0.72
-        needs_confirmation = not targets or confidence < 0.8 or mode == "snapshot_build"
+        confidence = 1.0 if exclusion else (0.96 if has_machine_headers and "logic_id" in headers else 0.72)
+        needs_confirmation = (
+            False
+            if exclusion
+            else not targets or confidence < 0.8 or mode == "snapshot_build"
+        )
         sheet = {
             "name": ws.title,
             "position": position,
@@ -222,6 +265,8 @@ def analyze_workbook(path: Path) -> dict[str, Any]:
             "target_fields": targets,
             "business_key_fields": business_keys,
             "mode": mode,
+            "excluded": bool(exclusion),
+            "exclusion_reason": exclusion,
             "confidence": confidence,
             "needs_confirmation": needs_confirmation,
             "merged_ranges": [str(item) for item in ws.merged_cells.ranges],
@@ -297,6 +342,111 @@ def read_rows(
     return result
 
 
+def allocate_blank_rows(
+    path: Path,
+    *,
+    sheet_name: str,
+    header_row: int,
+    column_count: int,
+    count: int,
+) -> list[int]:
+    """为增量快照优先分配已有空白模板行，不足时再扩展工作表。
+
+    只依据单元格内容判断空白；样式、行高或预先格式化不会让空行被误认为历史数据。
+    """
+
+    workbook = load_workbook(path, read_only=True, data_only=False)
+    ws = workbook[sheet_name]
+    allocated: list[int] = []
+    for row_number, values in enumerate(
+        ws.iter_rows(
+            min_row=header_row + 1,
+            max_col=column_count,
+            values_only=True,
+        ),
+        start=header_row + 1,
+    ):
+        if not any(not is_blank(value) for value in values):
+            allocated.append(row_number)
+            if len(allocated) == count:
+                break
+    next_row = max(ws.max_row + 1, header_row + 1)
+    while len(allocated) < count:
+        allocated.append(next_row)
+        next_row += 1
+    workbook.close()
+    return allocated
+
+
+def top_list_ai_batch_state(
+    path: Path,
+    *,
+    sheet_name: str,
+    header_row: int,
+    headers: list[str],
+    rank_year: int,
+) -> dict[str, Any]:
+    """判断当前年度官方批次是否已存在，并定位正式导出时需要失效的旧活动行。
+
+    幂等只认当前年度、固定福布斯 URL、活动状态和 50 个唯一公司名的完整批次。模板中虽然
+    存在 2026 历史数据，但来源是转载页面，因此不会误命中，仍会分配新的 50 行。
+    """
+
+    required = {"rank_year", "company_name", "source_url", "data_status"}
+    if not required.issubset(headers):
+        missing = ", ".join(sorted(required - set(headers)))
+        raise ValueError(f"top_list_ai is missing required batch fields: {missing}")
+    rows = read_rows(
+        path,
+        sheet_name=sheet_name,
+        header_row=header_row,
+        headers=headers,
+    )
+    official_rows: list[tuple[int, dict[str, Any]]] = []
+    superseded_rows: list[int] = []
+    for row_number, values in rows:
+        company = str(values.get("company_name") or "").strip()
+        if not company or values.get("data_status") == "删除":
+            continue
+        source_url = str(values.get("source_url") or "").strip().rstrip("/") + "/"
+        try:
+            row_year = int(values.get("rank_year"))
+        except (TypeError, ValueError):
+            row_year = None
+        if row_year == rank_year and source_url == FORBES_AI50_SOURCE_URL:
+            official_rows.append((row_number, values))
+        if values.get("data_status") == "新增":
+            superseded_rows.append(row_number)
+    names = {
+        str(values.get("company_name") or "").strip().casefold()
+        for _, values in official_rows
+        if str(values.get("company_name") or "").strip()
+    }
+    idempotent = len(official_rows) == TOP_LIST_AI_COUNT and len(names) == TOP_LIST_AI_COUNT
+    return {
+        "idempotent": idempotent,
+        "official_rows": [row_number for row_number, _ in official_rows],
+        "superseded_rows": [] if idempotent else sorted(set(superseded_rows)),
+    }
+
+
+def excel_output_value(field: str, value: Any) -> Any:
+    """把 Profile 中的 ISO 当前时间恢复为 Excel 原生日期时间。
+
+    RowContract 和数据库 JSON 必须使用带时区的 ISO 字符串；导出时去掉已经明确的本地时区
+    标记，写成 Excel 支持的无时区 ``datetime``，避免日期列显示为普通文本。
+    """
+
+    date_time_fields = {"collect_date", "datasource_date", "collection_date"}
+    if field not in date_time_fields or not isinstance(value, str) or "T" not in value:
+        return value
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return value
+    return parsed.replace(tzinfo=None)
+
+
 def export_reviewed_workbook(
     source: Path,
     destination: Path,
@@ -352,9 +502,16 @@ def export_reviewed_workbook(
                     raise ValueError(f"Unknown field {field!r} in sheet {sheet_name!r}")
                 cell = ws.cell(row_number, columns[field])
                 original_style = copy(cell._style)
-                cell.value = value
+                output_value = excel_output_value(field, value)
+                cell.value = output_value
                 cell._style = original_style
-                if isinstance(value, (date, datetime)) and not is_date_format(cell.number_format):
+                if field in {"collect_date", "datasource_date", "collection_date"} and isinstance(
+                    output_value, datetime
+                ):
+                    cell.number_format = "yyyy-mm-dd hh:mm:ss"
+                elif isinstance(output_value, (date, datetime)) and not is_date_format(
+                    cell.number_format
+                ):
                     cell.number_format = "yyyy-mm-dd"
     for sheet_name, (target_rows, target_columns) in sheet_dimensions.items():
         ws = workbook[sheet_name]

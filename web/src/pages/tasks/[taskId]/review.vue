@@ -45,6 +45,128 @@ const context = useQuery({
 const corrected = reactive<Record<string, unknown>>({});
 const comment = ref("");
 const selectedIds = ref<string[]>([]);
+const fieldLabels: Record<string, string> = {
+  index_name: "指标名称",
+  level: "级别",
+  region: "区域",
+  province: "省份",
+  city: "城市",
+  district: "区县",
+  other_region: "经济区",
+  statistical_date: "统计时间",
+  scope: "更新频次",
+  industry: "应用产业",
+  be_data: "来源原始值",
+  be_unit: "来源原始单位",
+  data: "标准值（程序换算）",
+  unit: "标准单位",
+  source_url: "采集来源链接",
+  logic_id: "数据标识",
+  collect_date: "采集时间",
+  rank: "当前排名",
+  name: "项目名称",
+  star: "收藏量",
+  star_unit: "收藏量单位",
+  source_department: "来源平台",
+  update_frequency: "更新频次",
+  datasource_date: "数据来源时间",
+  collection_date: "数据入库时间",
+  data_type: "数据类型",
+  data_status: "数据状态",
+  rank_year: "榜单年度",
+  company_name: "公司",
+  headquarter_location: "总部所在地",
+  CEO: "首席执行官",
+  financing_amount: "筹资金额",
+  financing_amount_unit: "筹资金额单位",
+  establish_date: "成立时间",
+  source: "来源机构",
+};
+const fieldLabel = (field: string) => fieldLabels[field] || field;
+const rowContract = computed(
+  () => context.data.value?.record?.rowContract || {},
+);
+const isAiIndex = computed(
+  () => rowContract.value.profile === "ai_index_v1",
+);
+const isAlgorithmCollection = computed(
+  () => rowContract.value.profile === "ai_algorithm_collection_monthly_v1",
+);
+const isForbesAi50 = computed(
+  () => rowContract.value.profile === "top_list_ai_forbes_annual_v1",
+);
+const algorithmApplicationFields = new Set([
+  "logic_id",
+  "collect_date",
+  "rank",
+  "star_unit",
+  "source_department",
+  "source_url",
+  "update_frequency",
+  "datasource_date",
+  "collection_date",
+  "data_type",
+  "data_status",
+]);
+const algorithmAudit = computed<Record<string, unknown>>(() => {
+  const values = context.data.value?.validation?.deterministic_profile_values;
+  return values && typeof values === "object"
+    ? (values as Record<string, unknown>)
+    : {};
+});
+const forbesApplicationFields = new Set([
+  "logic_id",
+  "rank_year",
+  "financing_amount_unit",
+  "source",
+  "source_url",
+  "update_frequency",
+  "datasource_date",
+  "collection_date",
+  "data_type",
+  "data_status",
+]);
+const forbesAudit = computed<Record<string, unknown>>(() => {
+  const values = context.data.value?.validation?.deterministic_profile_values;
+  return values && typeof values === "object"
+    ? (values as Record<string, unknown>)
+    : {};
+});
+const conversionAudit = computed<Record<string, unknown> | null>(() => {
+  const conversion = context.data.value?.validation?.conversion;
+  return conversion && typeof conversion === "object"
+    ? (conversion as Record<string, unknown>)
+    : null;
+});
+const conversionInputsChanged = computed(() => {
+  if (!conversionAudit.value) return false;
+  const originalValue = conversionAudit.value.source_value;
+  const originalUnit = conversionAudit.value.source_unit;
+  return (
+    String(corrected.be_data ?? "") !== String(originalValue ?? "") ||
+    String(corrected.be_unit ?? "") !== String(originalUnit ?? "")
+  );
+});
+const constraintAudit = computed(() => {
+  const required = Array.isArray(rowContract.value.required_matches)
+    ? (rowContract.value.required_matches as string[])
+    : [];
+  const matches = context.data.value?.validation?.constraint_matches;
+  const matchMap =
+    matches && typeof matches === "object"
+      ? (matches as Record<string, unknown>)
+      : {};
+  const descriptors =
+    rowContract.value.descriptors &&
+    typeof rowContract.value.descriptors === "object"
+      ? (rowContract.value.descriptors as Record<string, unknown>)
+      : {};
+  return required.map((field) => ({
+    field,
+    value: descriptors[field],
+    matched: matchMap[field] === true,
+  }));
+});
 const evidenceSourceOptions = computed(() => {
   // 同一网址可能对应多段证据；选择框按 URL 去重并优先展示模型最终采用的来源。
   const items = context.data.value?.evidence || [];
@@ -163,9 +285,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
   <div class="page-head">
     <div>
       <h1>逐行核对</h1>
-      <div class="muted">
-        左侧原始与过程数据，右侧模型建议、来源证据和最终值
-      </div>
+      <div class="muted">左侧原始与过程数据，右侧采集建议、来源证据和最终值</div>
     </div>
     <el-select v-model="filter" style="width: 180px"
       ><el-option
@@ -209,7 +329,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
               :value="s.row.resolutionStatus" /></template></el-table-column
         ><el-table-column label="字段"
           ><template #default="s">{{
-            s.row.targetFields.join("、")
+            s.row.targetFields.map(fieldLabel).join("、")
           }}</template></el-table-column
         ></el-table
       ><el-pagination
@@ -229,14 +349,92 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
           ><el-tab-pane label="原始数据"
             ><table class="json-table">
               <tr v-for="(v, k) in context.data.value.record?.rawData" :key="k">
-                <td>{{ k }}</td>
+                <td>{{ fieldLabel(String(k)) }}</td>
                 <td>{{ v }}</td>
               </tr>
             </table></el-tab-pane
           ><el-tab-pane label="过程数据">
-            <pre>{{
-              JSON.stringify(context.data.value.validation, null, 2)
-            }}</pre></el-tab-pane
+            <div v-if="isAiIndex" class="process-audit">
+              <el-descriptions :column="2" border>
+                <el-descriptions-item label="证据核验">
+                  <StatusTag
+                    :value="context.data.value.validation?.evidence_approved ? 'MATCHED' : 'UNRESOLVED'"
+                  />
+                </el-descriptions-item>
+                <el-descriptions-item label="行约束">
+                  <StatusTag
+                    :value="context.data.value.validation?.contract_valid ? 'MATCHED' : 'UNMATCHED'"
+                  />
+                </el-descriptions-item>
+                <el-descriptions-item label="换算方式">
+                  <StatusTag :value="String(conversionAudit?.mode || 'NOT_EVALUATED')" />
+                </el-descriptions-item>
+                <el-descriptions-item label="换算结果">
+                  <StatusTag :value="String(conversionAudit?.status || 'NOT_EVALUATED')" />
+                </el-descriptions-item>
+              </el-descriptions>
+              <div v-if="constraintAudit.length" class="constraint-list">
+                <div
+                  v-for="item in constraintAudit"
+                  :key="item.field"
+                  class="constraint-item"
+                >
+                  <span>{{ fieldLabel(item.field) }}：{{ item.value ?? '—' }}</span>
+                  <StatusTag :value="item.matched ? 'MATCHED' : 'UNMATCHED'" />
+                </div>
+              </div>
+            </div>
+            <div v-else-if="isAlgorithmCollection" class="process-audit">
+              <el-descriptions :column="2" border>
+                <el-descriptions-item label="榜单名次">
+                  第 {{ algorithmAudit.rank ?? rowContract.rank ?? '—' }} 名
+                </el-descriptions-item>
+                <el-descriptions-item label="证据核验">
+                  <StatusTag
+                    :value="context.data.value.validation?.evidence_approved ? 'MATCHED' : 'UNRESOLVED'"
+                  />
+                </el-descriptions-item>
+                <el-descriptions-item label="精确收藏数">
+                  {{ algorithmAudit.exact_stargazers_count ?? '—' }}
+                </el-descriptions-item>
+                <el-descriptions-item label="收藏量换算">
+                  {{ algorithmAudit.star_transform || '精确收藏数 ÷ 1000，向下取整' }}
+                </el-descriptions-item>
+                <el-descriptions-item label="快照时间" :span="2">
+                  {{ rowContract.snapshot_at || '—' }}
+                </el-descriptions-item>
+              </el-descriptions>
+            </div>
+            <div v-else-if="isForbesAi50" class="process-audit">
+              <el-descriptions :column="2" border>
+                <el-descriptions-item label="页面位置（非排名）">
+                  第 {{ forbesAudit.list_position ?? rowContract.list_position ?? '—' }} 条
+                </el-descriptions-item>
+                <el-descriptions-item label="证据核验">
+                  <StatusTag
+                    :value="context.data.value.validation?.evidence_approved ? 'MATCHED' : 'UNRESOLVED'"
+                  />
+                </el-descriptions-item>
+                <el-descriptions-item label="榜单年度">
+                  {{ forbesAudit.rank_year ?? rowContract.rank_year ?? '—' }}
+                </el-descriptions-item>
+                <el-descriptions-item label="官方发布时间">
+                  {{ forbesAudit.datasource_date ?? corrected.datasource_date ?? '—' }}
+                </el-descriptions-item>
+                <el-descriptions-item label="官方融资原文">
+                  {{ forbesAudit.funding_raw ?? '—' }}
+                </el-descriptions-item>
+                <el-descriptions-item label="程序换算公式">
+                  {{ forbesAudit.funding_formula ?? '—' }}
+                </el-descriptions-item>
+                <el-descriptions-item label="本次快照时间" :span="2">
+                  {{ rowContract.snapshot_at || '—' }}
+                </el-descriptions-item>
+              </el-descriptions>
+              <div class="conversion-note">福布斯 AI 50 按公司名称字母顺序展示且不设名次；这里的页面位置只用于切分单公司证据。</div>
+            </div>
+            <pre v-else>{{ JSON.stringify(context.data.value.validation, null, 2) }}</pre>
+          </el-tab-pane
           ><el-tab-pane label="审核历史">
             <pre>{{ JSON.stringify(context.data.value.history, null, 2) }}</pre>
           </el-tab-pane></el-tabs
@@ -326,13 +524,76 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
               :value="
                 context.data.value.riskLevel
               " /></el-descriptions-item></el-descriptions
+        ><div v-if="isAiIndex" class="conversion-card">
+          <div class="route-title">
+            <b>原始值与标准值换算</b>
+            <StatusTag :value="String(conversionAudit?.mode || 'NOT_EVALUATED')" />
+          </div>
+          <div class="conversion-flow">
+            <div>
+              <span>来源原始数据</span>
+              <strong>{{ corrected.be_data ?? '—' }} {{ corrected.be_unit || '（无量纲）' }}</strong>
+            </div>
+            <span class="conversion-arrow">→</span>
+            <div>
+              <span>标准数据</span>
+              <strong>{{ conversionInputsChanged ? '保存时自动重算' : (conversionAudit?.result ?? corrected.data ?? '—') }} {{ rowContract.standard_unit || '（无量纲）' }}</strong>
+            </div>
+          </div>
+          <el-descriptions v-if="conversionAudit" :column="2" border>
+            <el-descriptions-item label="换算状态">
+              <StatusTag :value="String(conversionAudit.status || 'NOT_EVALUATED')" />
+            </el-descriptions-item>
+            <el-descriptions-item label="规则版本">{{ conversionAudit.rule_version || '—' }}</el-descriptions-item>
+            <el-descriptions-item label="计算公式" :span="2">{{ conversionAudit.formula || '—' }}</el-descriptions-item>
+            <el-descriptions-item v-if="conversionAudit.reason" label="说明" :span="2">{{ conversionAudit.reason }}</el-descriptions-item>
+          </el-descriptions>
+          <div class="conversion-note">标准值由系统根据来源原始值、来源原始单位和标准单位生成，人工修正时会再次重算。</div>
+        </div
+        ><div v-if="isAlgorithmCollection" class="conversion-card">
+          <div class="route-title">
+            <b>GitHub 月度前十快照</b>
+            <StatusTag value="DIRECT_LINK" />
+          </div>
+          <el-descriptions :column="3" border>
+            <el-descriptions-item label="当前排名">第 {{ corrected.rank ?? '—' }} 名</el-descriptions-item>
+            <el-descriptions-item label="项目名称">{{ corrected.name ?? '—' }}</el-descriptions-item>
+            <el-descriptions-item label="收藏量">{{ corrected.star ?? '—' }} {{ corrected.star_unit || 'k' }}</el-descriptions-item>
+            <el-descriptions-item label="采集时间" :span="3">{{ corrected.collect_date ?? '—' }}</el-descriptions-item>
+          </el-descriptions>
+          <div class="conversion-note">排名、时间、来源和固定元数据由系统生成；人工只需在必要时修正项目名称或整数 k 收藏量。</div>
+        </div
+        ><div v-if="isForbesAi50" class="conversion-card">
+          <div class="route-title">
+            <b>福布斯年度 AI 50 官方快照</b>
+            <StatusTag value="DIRECT_LINK" />
+          </div>
+          <el-descriptions :column="3" border>
+            <el-descriptions-item label="公司">{{ corrected.company_name ?? '—' }}</el-descriptions-item>
+            <el-descriptions-item label="总部">{{ corrected.headquarter_location ?? '—' }}</el-descriptions-item>
+            <el-descriptions-item label="首席执行官">{{ corrected.CEO ?? '—' }}</el-descriptions-item>
+            <el-descriptions-item label="筹资金额">{{ corrected.financing_amount ?? '—' }} {{ corrected.financing_amount_unit || '亿美元' }}</el-descriptions-item>
+            <el-descriptions-item label="成立时间">{{ corrected.establish_date ?? '—' }}</el-descriptions-item>
+            <el-descriptions-item label="榜单年度">{{ corrected.rank_year ?? '—' }}</el-descriptions-item>
+            <el-descriptions-item label="采集时间" :span="3">{{ corrected.collection_date ?? '—' }}</el-descriptions-item>
+          </el-descriptions>
+          <div class="conversion-note">融资额优先由官方百万美元数值确定性换算为亿美元；来源、年度、时间和批次状态由系统锁定。正式导出完整 50 家后，旧活动批次才会统一标记为删除。</div>
+        </div
         ><el-form label-position="top"
           ><el-form-item
             v-for="field in context.data.value.targetFields"
             :key="field"
-            :label="field"
-            ><el-select
-              v-if="field === 'source_url'"
+            :label="fieldLabel(field)"
+            ><el-input
+              v-if="
+                (isAlgorithmCollection && algorithmApplicationFields.has(field)) ||
+                (isForbesAi50 && forbesApplicationFields.has(field))
+              "
+              :model-value="corrected[field]"
+              disabled
+            />
+            <el-select
+              v-else-if="field === 'source_url'"
               v-model="corrected[field]"
               filterable
               allow-create
@@ -348,7 +609,14 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
                 :value="item.sourceUrl"
               />
             </el-select>
-            <el-input v-else v-model="corrected[field]" /></el-form-item></el-form
+            <el-input
+              v-else-if="isAiIndex && field === 'data'"
+              :model-value="conversionInputsChanged ? '保存时自动重算' : corrected[field]"
+              disabled
+              placeholder="由系统自动换算，无需人工填写"
+            />
+            <el-input v-else v-model="corrected[field]" />
+          </el-form-item></el-form
         ><el-collapse
           ><el-collapse-item
             :title="`来源证据（${context.data.value.evidence?.length || 0}）`"
@@ -407,5 +675,57 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
   align-items: center;
   justify-content: space-between;
   margin-bottom: 12px;
+}
+.process-audit,
+.conversion-card {
+  display: grid;
+  gap: 14px;
+}
+.conversion-card {
+  padding: 14px;
+  margin-bottom: 16px;
+  border: 1px solid #c7e8d1;
+  border-radius: 10px;
+  background: #f6fdf8;
+}
+.conversion-flow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  gap: 14px;
+  align-items: center;
+}
+.conversion-flow > div {
+  display: grid;
+  gap: 4px;
+  padding: 12px;
+  border-radius: 8px;
+  background: #fff;
+}
+.conversion-flow span,
+.conversion-note {
+  color: #64748b;
+  font-size: 13px;
+}
+.conversion-flow strong {
+  font-size: 17px;
+}
+.conversion-arrow {
+  color: #16a34a !important;
+  font-size: 22px !important;
+}
+.constraint-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 8px;
+}
+.constraint-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #fff;
 }
 </style>

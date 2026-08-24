@@ -12,6 +12,18 @@ depends_on = None
 
 
 def upgrade() -> None:
+    inspector = sa.inspect(op.get_bind())
+    existing_tables = set(inspector.get_table_names())
+    unit_columns = {column["name"] for column in inspector.get_columns("collection_units")}
+    decision_columns = {column["name"] for column in inspector.get_columns("review_decisions")}
+    export_columns = {column["name"] for column in inspector.get_columns("export_jobs")}
+    if {"review_policies", "review_batches"}.issubset(existing_tables) and {
+        "review_policy_id",
+        "review_sampled",
+    }.issubset(unit_columns) and {"policy_id", "metadata_json"}.issubset(
+        decision_columns
+    ) and "unresolved_object_key" in export_columns:
+        return
     sqlite = op.get_bind().dialect.name == "sqlite"
     op.create_table(
         "review_policies",

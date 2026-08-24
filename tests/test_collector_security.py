@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
 
 import pytest
@@ -9,6 +10,7 @@ from metric_pulse.collector import (
     CollectionResult,
     EvidenceItem,
     OMLXCollector,
+    apply_ai_index_conversion,
     apply_source_provenance,
     apply_verification,
     build_search_query,
@@ -19,6 +21,12 @@ from metric_pulse.collector import (
     validate_public_url,
 )
 from metric_pulse.config import get_settings
+from metric_pulse.dataset_profiles import (
+    AI_ALGORITHM_COLLECTION_TARGET_FIELDS,
+    GITHUB_TOP_REPOSITORIES_API_URL,
+    GITHUB_TOP_REPOSITORIES_SOURCE_URL,
+    ai_algorithm_collection_row_contract,
+)
 from metric_pulse.models import CollectionUnit, DataRecord
 from metric_pulse.processor import validate_production_collection_contract
 from metric_pulse.source_pipeline import SourceDocument
@@ -27,6 +35,47 @@ from metric_pulse.source_pipeline import SourceDocument
 def _address(ip: str, port: int = 443):
     family = socket.AF_INET6 if ":" in ip else socket.AF_INET
     return (family, socket.SOCK_STREAM, 6, "", (ip, port))
+
+
+def test_ai_index_program_conversion_overrides_model_data_candidate() -> None:
+    values, conversion = apply_ai_index_conversion(
+        values={"be_data": 500, "be_unit": "百万美元", "data": 999},
+        row_contract={
+            "standard_unit": "亿美元",
+            "field_roles": {"derived": ["data"]},
+        },
+        verification={"conversion": {"result": 999}},
+        evidence_approved=True,
+    )
+
+    assert values["data"] == 5
+    assert conversion["mode"] == "DETERMINISTIC"
+    assert conversion["factor"] == "0.01"
+
+
+def test_ai_index_unknown_unit_uses_only_complete_verify_fallback() -> None:
+    values, conversion = apply_ai_index_conversion(
+        values={"be_data": 3, "be_unit": "兆样本", "data": None},
+        row_contract={
+            "standard_unit": "亿样本",
+            "field_roles": {"derived": ["data"]},
+        },
+        verification={
+            "conversion": {
+                "mode": "MODEL_FALLBACK",
+                "source_value": 3,
+                "source_unit": "兆样本",
+                "target_unit": "亿样本",
+                "result": 30000,
+                "formula": "3 x 10000 = 30000",
+                "reason": "兆与亿的十进制数量级换算",
+            }
+        },
+        evidence_approved=True,
+    )
+
+    assert values["data"] == 30000
+    assert conversion["mode"] == "MODEL_FALLBACK"
 
 
 def test_configured_proxy_fake_ip_is_allowed_for_hostname(monkeypatch) -> None:
@@ -73,11 +122,11 @@ def test_extract_structured_values_maps_single_metric_column() -> None:
     extracted = extract_structured_values(
         source,
         {"region": "BY", "statistical_date": "2025Q2"},
-        ["be_data", "data"],
+        ["be_data"],
     )
 
     assert extracted == (
-        {"be_data": 358848, "data": 358848},
+        {"be_data": 358848},
         "developers,iso2_code,year,quarter\n358848,BY,2025,2",
     )
 
@@ -104,12 +153,12 @@ def test_github_innovation_graph_ec_2021q3_is_uniquely_matched() -> None:
     }
 
     diagnostics = structured_match_diagnostics(source, descriptors)
-    extracted = extract_structured_values(source, descriptors, ["be_data", "data"])
+    extracted = extract_structured_values(source, descriptors, ["be_data"])
 
     assert diagnostics["status"] == "UNIQUE_MATCH"
     assert diagnostics["match_count"] == 1
     assert extracted == (
-        {"be_data": 125033, "data": 125033},
+        {"be_data": 125033},
         "developers,iso2_code,year,quarter\n125033,EC,2021,3",
     )
 
@@ -385,17 +434,22 @@ def test_direct_structured_source_skips_search_and_still_runs_two_calls(monkeypa
             calls.append(prompt)
             if len(calls) == 1:
                 return {
-                    "values": {"be_data": 125033, "data": 125033},
+                    "values": {"be_data": 125033, "be_unit": "位", "data": 125033},
                     "source_indices": [1],
                     "confidence": 1,
                     "conflicts": [],
                 }
             return {
                 "approved": True,
-                "values": {"be_data": 125033, "data": 125033},
+                "values": {"be_data": 125033, "be_unit": "位", "data": 125033},
                 "source_indices": [1],
                 "confidence": 1,
                 "conflicts": [],
+                "constraint_matches": {
+                    "index_name": True,
+                    "region": True,
+                    "statistical_date": True,
+                },
                 "reason": "exact EC 2021 Q3 row",
             }
 
@@ -426,18 +480,27 @@ def test_direct_structured_source_skips_search_and_still_runs_two_calls(monkeypa
         business_key="ai-index-1955",
         raw_data={"source_url": ("https://github.com/github/innovationgraph/blob/main/data/developers.csv")},
         row_contract={
+            "profile": "ai_index_v1",
             "descriptors": {
                 "region": "EC",
                 "statistical_date": "2021Q3",
                 "index_name": "Github开发者数量",
-            }
+            },
+            "required_matches": ["index_name", "region", "statistical_date"],
+            "standard_unit": "位",
+            "field_roles": {
+                "observed": ["be_data", "be_unit"],
+                "derived": ["data"],
+                "standard_unit": "unit",
+                "provenance": "source_url",
+            },
         },
     )
-    unit = CollectionUnit(target_fields=["be_data", "data"])
+    unit = CollectionUnit(target_fields=["be_data", "be_unit", "data"])
 
     result = asyncio.run(OMLXCollector(FakeClient()).collect(record, unit))
 
-    assert result.values == {"be_data": 125033, "data": 125033}
+    assert result.values == {"be_data": 125033, "be_unit": "位", "data": 125033}
     assert len(calls) == 2
     assert result.search_attempt is None
     assert result.acquisition_attempt["route"] == "DIRECT_LINK"
@@ -618,3 +681,149 @@ def test_same_direct_source_fetches_once_but_keeps_two_model_calls_per_row(
     assert len(prompts) == 4
     assert all("ROW_B" not in prompt for prompt in prompts[:2])
     assert all("ROW_A" not in prompt for prompt in prompts[2:])
+
+
+def test_github_monthly_rank_uses_fixed_source_and_isolates_one_repository(monkeypatch) -> None:
+    prompts: list[str] = []
+    snapshot_at = "2026-08-24T21:00:00+08:00"
+    headers = list(AI_ALGORITHM_COLLECTION_TARGET_FIELDS)
+    raw_data, row_contract, target_fields = ai_algorithm_collection_row_contract(
+        sheet_name="人工智能算法收藏(ai_algorithm_collectio",
+        source_row=7,
+        rank=4,
+        snapshot_at=snapshot_at,
+        headers=headers,
+    )
+    repositories = [
+        {"full_name": f"owner/repository-{rank}", "stargazers_count": 200_000 - rank * 1_111}
+        for rank in range(1, 13)
+    ]
+
+    class FakeClient:
+        async def generate_json(self, *, system, prompt, image_png=None):
+            prompts.append(prompt)
+            if len(prompts) == 1:
+                return {
+                    "values": {"name": "owner/repository-4", "star": 195},
+                    "source_indices": [1],
+                }
+            return {
+                "approved": True,
+                # 即使模型值偏离，应用也只能采用程序从同一证据生成的确定性结果。
+                "values": {"name": "model/wrong", "star": 999_999},
+                "source_indices": [1],
+                "constraint_matches": {"rank": True},
+                "confidence": 1,
+                "conflicts": [],
+                "reason": "the one-row GitHub evidence matches rank four",
+            }
+
+    async def fake_gather(candidates, *_args, **_kwargs):
+        assert len(candidates) == 1
+        assert candidates[0].source_url == GITHUB_TOP_REPOSITORIES_API_URL
+        return [
+            SourceDocument(
+                index=1,
+                url=GITHUB_TOP_REPOSITORIES_API_URL,
+                requested_url=GITHUB_TOP_REPOSITORIES_API_URL,
+                normalized_url=GITHUB_TOP_REPOSITORIES_API_URL,
+                media_type="application/json",
+                text=json.dumps({"items": repositories}),
+                content_hash="d" * 64,
+            )
+        ]
+
+    async def search_must_not_run(_query, *, limit):
+        raise AssertionError("the fixed GitHub ranking profile must not use generic search")
+
+    monkeypatch.setattr("metric_pulse.collector.gather_source_documents", fake_gather)
+    monkeypatch.setattr("metric_pulse.collector.discover_sources", search_must_not_run)
+
+    result = asyncio.run(
+        OMLXCollector(FakeClient()).collect(
+            DataRecord(
+                sheet_name="人工智能算法收藏(ai_algorithm_collectio",
+                source_row=7,
+                business_key="snapshot-rank-4",
+                raw_data=raw_data,
+                row_contract=row_contract,
+            ),
+            CollectionUnit(target_fields=target_fields),
+        )
+    )
+
+    expected_star = repositories[3]["stargazers_count"] // 1_000
+    assert result.values["name"] == "owner/repository-4"
+    assert result.values["star"] == expected_star
+    assert result.values["star_unit"] == "k"
+    assert result.values["rank"] == 4
+    assert result.values["collect_date"] == snapshot_at
+    assert result.values["datasource_date"] == snapshot_at
+    assert result.values["collection_date"] == snapshot_at
+    assert result.values["source_department"] == "Github"
+    assert result.values["source_url"] == GITHUB_TOP_REPOSITORIES_SOURCE_URL
+    assert result.values["update_frequency"] == "month"
+    assert result.values["data_type"] == "采集"
+    assert result.values["data_status"] == "新增"
+    assert len(result.values["logic_id"]) == 64
+    assert result.search_attempt is None
+    assert result.acquisition_attempt["route"] == "DIRECT_LINK"
+    assert len(prompts) == 2
+    assert all("owner/repository-4" in prompt for prompt in prompts)
+    assert all("owner/repository-3" not in prompt for prompt in prompts)
+    assert all("owner/repository-5" not in prompt for prompt in prompts)
+    assert result.validation["deterministic_profile_values"]["exact_stargazers_count"] == (
+        repositories[3]["stargazers_count"]
+    )
+
+
+def test_github_monthly_rank_fails_closed_without_search_when_snapshot_is_short(
+    monkeypatch,
+) -> None:
+    async def fake_gather(*_args, **_kwargs):
+        return [
+            SourceDocument(
+                index=1,
+                url=GITHUB_TOP_REPOSITORIES_API_URL,
+                media_type="application/json",
+                text=json.dumps(
+                    {
+                        "items": [
+                            {"full_name": f"owner/repository-{rank}", "stargazers_count": 20_000}
+                            for rank in range(1, 10)
+                        ]
+                    }
+                ),
+            )
+        ]
+
+    async def search_must_not_run(_query, *, limit):
+        raise AssertionError("an incomplete fixed-source snapshot must not fall back to search")
+
+    class ModelMustNotRun:
+        async def generate_json(self, **_kwargs):
+            raise AssertionError("the model must not run on an incomplete deterministic snapshot")
+
+    raw_data, row_contract, target_fields = ai_algorithm_collection_row_contract(
+        sheet_name="人工智能算法收藏(ai_algorithm_collectio",
+        source_row=4,
+        rank=1,
+        snapshot_at="2026-08-24T21:00:00+08:00",
+        headers=list(AI_ALGORITHM_COLLECTION_TARGET_FIELDS),
+    )
+    monkeypatch.setattr("metric_pulse.collector.gather_source_documents", fake_gather)
+    monkeypatch.setattr("metric_pulse.collector.discover_sources", search_must_not_run)
+
+    with pytest.raises(RuntimeError, match="GitHub ranking acquisition is incomplete"):
+        asyncio.run(
+            OMLXCollector(ModelMustNotRun()).collect(
+                DataRecord(
+                    sheet_name="人工智能算法收藏(ai_algorithm_collectio",
+                    source_row=4,
+                    business_key="snapshot-rank-1",
+                    raw_data=raw_data,
+                    row_contract=row_contract,
+                ),
+                CollectionUnit(target_fields=target_fields),
+            )
+        )
