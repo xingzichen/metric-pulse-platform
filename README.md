@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-第一版端到端系统已经实现，可在本地开发环境或 Docker Compose 中运行。本轮没有部署到 NAS。
+第一版端到端系统已经实现，可在本地开发环境或 Docker Compose 中运行。当前 API/Web 和采集任务在本地 Mac 运行，来源发现使用 NAS Docker 中的 SearXNG；应用本身尚未切换到 NAS 生产部署。
 
 已实现的业务闭环：
 
@@ -14,13 +14,16 @@
 - Excel 上传、哈希存储、11 类工作表的通用 OOXML 结构识别和预览；
 - 本地 Qwen3.8 多模态语义识别，结构字段由程序交叉校验；
 - 任务规划、启动、暂停、恢复、停止、失败重试和软删除；
-- Celery/Redis worker、PostgreSQL 并发领取和运行版本隔离；
-- 可选 SearXNG 来源发现、受 SSRF 约束的抓取、OMLX 字段提取和证据保存；
-- 原始数据、行约束、模型建议、校验过程、证据和审核历史的逐行核对；
-- 确认、修正、驳回重采、暂缓和受控批量确认；
+- 当前 eager `TaskProcessor` 的运行版本隔离，以及 Compose 中已配置但尚未生产切换验收的 Celery/Redis/PostgreSQL worker 路径；
+- 工作簿采集直链优先、确定性结构化匹配；直链失败/无数据/歧义时才降级到 SearXNG 前 10 条，并保存完整路由审计；
+- HTML 主文去噪、PDF/Word/图片提取，以及对 403/429、JS 空壳和过短正文的 Playwright Chromium 回退；
+- OMLX 仅使用 `Qwen3.8-27B-6bit`、全局并发 1；每行固定串行执行多源候选综合和独立证据复核，对日期、地域、口径和单位失配失败关闭；
+- execution/resolution/review 三套正交状态、原因/风险分类与独立统计；
+- 原始数据、行约束、模型建议、校验过程、证据和审核历史的异常优先核对；
+- ReviewPolicy 自动通过/抽样/熔断、快照式批量 preview/commit、`CONFIRMED_UNRESOLVED` 与未解决报告；
 - 严格审核门禁、导出失效管理和保留格式的 Excel 回写；
 - Vue 3 + Element Plus Web 工作台，Vue Router 5 自动文件路由；
-- Alembic 初始迁移、API/worker/web Docker 镜像和 Compose 编排。
+- Alembic 初始及 P0 迁移、API/worker/web Docker 镜像和 Compose 编排。
 
 真实测试工作簿的验收结论见 [验收报告](docs/acceptance-report.md)。
 
@@ -51,7 +54,7 @@ cp .env.example .env
 docker compose up --build -d
 ```
 
-默认 Web 端口为 `8080`。Compose 默认连接 `http://10.0.0.203:5008/v1` 的 OMLX 服务，可通过环境变量覆盖。本轮只验证了 Compose 配置，没有部署或修改 NAS。
+默认 Web 端口为 `8080`。Compose 默认连接 `http://10.0.0.203:5008/v1` 的 OMLX 服务，可通过环境变量覆盖。当前 NAS 上已部署 SearXNG 供本地应用使用，但 API/worker/web Compose 仍只完成配置校验，未切换生产流量。
 
 ## 质量验证
 
@@ -72,8 +75,8 @@ OMLX 视觉集成测试默认跳过；显式提供临时环境变量后运行 `t
 - 对近空清单型工作表执行完整快照构建和业务键对账。
 - 任务可以可靠地启动、暂停、恢复、停止、重试和软删除。
 - 每个结果都可追溯到原始行、来源证据、处理步骤和审核记录。
-- 用户主要处理异常和低置信度结果，并可受控批量确认高质量结果。
-- 只有满足审核门禁的结果才允许生成正式导出。
+- 用户主要处理异常和低置信度结果；低风险、确定性验证闭环的结果由版本化策略自动通过，高质量结果可受控批量确认。
+- 只有满足可审计的自动/人工审核门禁的结果才允许生成正式导出；已确认无法安全填值的项随未解决报告导出。
 - 基于原始工作簿回填最终审核值，保持工作表结构、顺序和必要格式。
 
 ## 推荐技术栈
@@ -102,20 +105,24 @@ OMLX 视觉集成测试默认跳过；显式提供临时环境变量后运行 `t
 - [ADR-0001：总体技术与架构决策](docs/adr/0001-technology-and-architecture.md)
 - [ADR-0002：Vue 前端、组件库与自动文件路由](docs/adr/0002-vue-frontend-and-file-routing.md)
 - [ADR-0003：本地多模态模型识别架构](docs/adr/0003-local-multimodal-recognition.md)
+- [ADR-0004：质量优先的多源网页采集与浏览器回退](docs/adr/0004-quality-first-web-acquisition.md)
+- [ADR-0005：P0 状态、吞吐、审核与金标边界](docs/adr/0005-p0-state-throughput-review-and-gold-boundary.md)
+- [ADR-0006：采集直链优先、来源上下文复用与单行隔离](docs/adr/0006-direct-source-first-and-row-isolation.md)
+- [2026-08-24 需求与技术方案一致性回检](docs/requirements-consistency-review-2026-08-24.md)
 
 ## 需求来源
 
 设计综合以下需求基线：
 
-- [工作区 V2.1 需求文档](../需求文档.md)
-- [工作区 V2.1 技术方案](../技术方案文档.md)
+- [工作区 V2.4 需求文档](../需求文档.md)
+- [工作区 V2.4 技术方案](../技术方案文档.md)
 - [平台化需求文档](../metric-pulse-service/docs/excel-data-collection-platform-requirements.md)
 
 其中：
 
-- V2.1 文档定义完整工作簿构建、`RowContract`、快照枚举和业务键对账。
+- V2.4 文档定义完整工作簿构建、`RowContract`、快照枚举、业务键对账，并确定 `P0-3 状态语义 → P0-2 吞吐 → P0-4 审核效率` 的实施顺序。直链存在时先获取并匹配，只有失败、无数据或歧义才逐行搜索；不得跨行复用搜索结论、批处理/并发模型或省略每行的两次 Qwen 调用。
 - 平台化需求定义用户、任务控制、人工审核、导出门禁和 Web 工作台。
-- 两者冲突时，以“正式导出必须经过审核门禁”和“行级结果组必须原子提交”为当前设计决策。
+- 两者冲突时，以“正式导出必须经过可审计的自动/人工审核门禁”、“行级结果组必须原子提交”和“金标只在平台外部验收”为当前设计决策。
 
 内部可以在审核前生成预览工作簿，但预览产物不能作为正式导出下载或对外发布。
 
@@ -145,6 +152,10 @@ metric-pulse-platform/
 9. 所有写操作幂等，所有状态转换带预期版本。
 10. OpenAPI 是前后端契约，前端 Client 自动生成。
 11. Web 页面以文件结构生成强类型路由，权限和布局由路由元数据统一声明。
+12. 执行、业务解决和审核状态正交建模，不用 `SUCCEEDED` 推导数据已填齐。
+13. 历史金标只供平台运行完成后的外部测试/验收比较器使用，不得进入生产运行时。
+14. 每行独立完成可审计的 `DIRECT_LINK/SEARCH_FALLBACK` 获取路由；搜索仅在无直链或直链失败、无数据、歧义时发生。OMLX 只使用 `Qwen3.8-27B-6bit`、全局并发 1，每行固定两次串行独立请求，禁止模型批处理和跨行会话。
+15. `preserve` 只由当次业务配置/用户授权决定，不能由金标产生或推断。
 
 ## 首个里程碑
 

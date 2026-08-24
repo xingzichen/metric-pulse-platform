@@ -1,3 +1,9 @@
+"""任务状态机及前端可用操作推导。
+
+PAUSING/STOPPING 是等待 worker 在安全边界确认的中间态，不能直接解释为已经暂停或停止；
+所有控制操作都必须经过显式迁移表。
+"""
+
 from __future__ import annotations
 
 from .models import TaskStatus
@@ -33,6 +39,8 @@ class InvalidTransition(ValueError):
 
 
 def ensure_transition(current: str | TaskStatus, target: str | TaskStatus) -> None:
+    """验证单次迁移；调用方负责持久化状态和审计。"""
+
     source = TaskStatus(current)
     destination = TaskStatus(target)
     if destination not in ALLOWED_TRANSITIONS[source]:
@@ -40,6 +48,8 @@ def ensure_transition(current: str | TaskStatus, target: str | TaskStatus) -> No
 
 
 def allowed_actions(status: str | TaskStatus) -> list[str]:
+    """从同一状态语义推导前端操作，避免 UI 自建不一致规则。"""
+
     value = TaskStatus(status)
     actions: list[str] = []
     if value in {TaskStatus.DRAFT, TaskStatus.PAUSED, TaskStatus.FAILED, TaskStatus.SUCCEEDED_WITH_ERRORS}:

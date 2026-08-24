@@ -4,6 +4,9 @@ import { useQuery, useQueryClient } from "@tanstack/vue-query";
 import { ElMessage } from "element-plus";
 import { api, post } from "../../../api";
 import StatusTag from "../../../components/StatusTag.vue";
+import { getBlockerLabel } from "../../../status-display";
+
+// 导出中心把“是否可导出”与“历史导出作业”分开查询，避免生成按钮只依赖页面推算。
 const id = String(useRoute<"/tasks/[taskId]/exports">().params.taskId);
 const qc = useQueryClient();
 const ready = useQuery({
@@ -22,6 +25,7 @@ const jobs = useQuery({
         status: string;
         createdAt: string;
         error?: string;
+        hasUnresolvedReport: boolean;
       }[];
     }>(`/api/v1/tasks/${id}/exports`),
 });
@@ -36,6 +40,7 @@ async function create() {
 }
 </script>
 <template>
+  <!-- 正式导出由服务端门禁裁决；前端仅翻译阻断原因并禁用按钮。 -->
   <div class="page-head">
     <div>
       <h1>导出中心</h1>
@@ -59,7 +64,7 @@ async function create() {
         v-for="b in ready.data.value?.blockers"
         :key="b.code"
         style="margin-right: 16px"
-        >{{ b.code }}：{{ b.count }}</span
+        >{{ getBlockerLabel(b.code) }}：{{ b.count }}</span
       ></template
     ></el-alert
   ><el-alert
@@ -87,6 +92,12 @@ async function create() {
             tag="a"
             :href="`/api/v1/exports/${s.row.id}/download`"
             >下载</el-button
+          ><el-button
+            v-if="s.row.status === 'READY' && s.row.hasUnresolvedReport"
+            link
+            tag="a"
+            :href="`/api/v1/exports/${s.row.id}/unresolved-report`"
+            >未解决报告</el-button
           ></template
         ></el-table-column
       ></el-table

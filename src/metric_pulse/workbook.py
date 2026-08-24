@@ -1,3 +1,10 @@
+"""Excel 结构识别、行读取、预览渲染与结果导出。
+
+识别首先依赖确定性 OOXML 统计：表头、空值比例、字段命名和样例分布；视觉模型只是可选
+辅助，不可发明工作簿不存在的字段。导出在原工作簿副本上写入审核后的最终值，保留布局和
+任务范围外数据。
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -52,6 +59,8 @@ TARGET_HINTS = {
 
 
 def json_value(value: Any) -> Any:
+    """把 Excel 单元格值转换为可稳定写入 JSON 的类型。"""
+
     if isinstance(value, (date, datetime)):
         return value.isoformat()
     if isinstance(value, bytes):
@@ -69,6 +78,8 @@ def normalized_header(value: Any, index: int) -> str:
 
 
 def find_header_row(ws, *, scan_rows: int = 15) -> int:
+    """在前若干行中按机器字段名、唯一性和 logic_id 特征选择最可能的表头。"""
+
     candidates: list[tuple[float, int]] = []
     max_column = min(ws.max_column, 200)
     for row_index in range(1, min(ws.max_row, scan_rows) + 1):
@@ -89,6 +100,8 @@ def find_header_row(ws, *, scan_rows: int = 15) -> int:
 
 
 def make_unique_headers(values: list[Any]) -> list[str]:
+    """为空表头生成坐标名，并为重复表头添加稳定序号后缀。"""
+
     counts: Counter[str] = Counter()
     headers: list[str] = []
     for index, value in enumerate(values, start=1):
@@ -99,6 +112,8 @@ def make_unique_headers(values: list[Any]) -> list[str]:
 
 
 def _field_stats(ws, header_row: int, headers: list[str], sample_limit: int = 1000) -> dict[str, dict]:
+    """在有限样本内计算空值率、唯一率和示例，避免扫描超大工作簿全部单元格。"""
+
     row_count = max(0, ws.max_row - header_row)
     sample_count = min(row_count, sample_limit)
     result: dict[str, dict] = {}
@@ -121,6 +136,8 @@ def _field_stats(ws, header_row: int, headers: list[str], sample_limit: int = 10
 
 
 def _suggest_fields(headers: list[str], stats: dict[str, dict]) -> tuple[list[str], list[str], list[str]]:
+    """根据命名提示和数据分布建议描述字段、目标字段和业务键。"""
+
     business_keys = [field for field in headers if field in {"logic_id", "id"}]
     if not business_keys:
         business_keys = [
@@ -162,6 +179,12 @@ def _suggest_fields(headers: list[str], stats: dict[str, dict]) -> tuple[list[st
 
 
 def analyze_workbook(path: Path) -> dict[str, Any]:
+    """确定性分析整个工作簿，并生成结构哈希与逐表字段建议。
+
+    结构哈希只包含表名、表头和位置等结构信息，可用于模板匹配；不会把业务值当作模板。
+    低置信度、没有目标字段或快照表需要人工确认。
+    """
+
     workbook = load_workbook(path, read_only=False, data_only=False)
     sheets: list[dict[str, Any]] = []
     signature_parts: list[str] = []
@@ -217,6 +240,8 @@ def analyze_workbook(path: Path) -> dict[str, Any]:
 
 
 def render_sheet_preview(path: Path, sheet_name: str, *, max_rows: int = 25, max_cols: int = 16) -> bytes:
+    """渲染带坐标的有限工作表预览，供视觉模型和人工识别结构。"""
+
     workbook = load_workbook(path, read_only=True, data_only=False)
     ws = workbook[sheet_name]
     rows = min(ws.max_row, max_rows)
@@ -251,6 +276,8 @@ def read_rows(
     header_row: int,
     headers: list[str],
 ) -> list[tuple[int, dict[str, Any]]]:
+    """读取非空数据行并保留真实 Excel 行号，供证据定位和原位导出。"""
+
     workbook = load_workbook(path, read_only=True, data_only=False)
     ws = workbook[sheet_name]
     result: list[tuple[int, dict[str, Any]]] = []
@@ -278,6 +305,12 @@ def export_reviewed_workbook(
     column_definitions: dict[str, list[tuple[str, Any, Any]]] | None = None,
     sheet_dimensions: dict[str, tuple[int, int]] | None = None,
 ) -> None:
+    """把审核后的字段值原位写入工作簿副本，并尽量保留样式和日期格式。
+
+    可选列定义用于快照构建时增加目标列；扩展行/列会复制相邻模板样式。未知字段直接报错，
+    防止拼写错误悄悄创建不可见数据。
+    """
+
     workbook = load_workbook(source, read_only=False, data_only=False)
     column_definitions = column_definitions or {}
     sheet_dimensions = sheet_dimensions or {}

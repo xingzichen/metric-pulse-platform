@@ -4,9 +4,9 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 文档版本 | v1.1 |
-| 状态 | 系统设计基线草案 |
-| 更新日期 | 2026-08-23 |
+| 文档版本 | v1.5 |
+| 状态 | 当前实现同步稿 + 已批准 P0 改造目标 |
+| 更新日期 | 2026-08-24 |
 | 目标项目 | `metric-pulse-platform` |
 | 架构风格 | Python 模块化单体、API/worker 运行时分离、事件驱动协作 |
 
@@ -23,7 +23,23 @@
 - 平台问题：上传、任务控制、状态查询、人工核对、权限、审计和导出门禁。
 - 采集问题：`RowContract` 约束驱动采集、清单快照枚举、业务键对账、来源证据、复合结果组和完整工作簿构建。
 
-正式导出必须经过人工审核门禁。系统可以在审核前生成内部预览产物，但预览不是正式导出。
+正式导出必须经过审核门禁。门禁可由版本化自动审核策略或人工决策满足；只有低风险、确定性验证闭环的结果才允许自动通过。系统可以在审核前生成内部预览产物，但预览不是正式导出。
+
+历史金标只是项目外部的测试/验收比较基准。平台生产包、API、worker、模型、运行配置和数据库不得读取、引用或推断金标；平台完成采集后，独立验收工具才可做业务键和字段语义比较。
+
+### 2.1 当前实现与目标架构边界
+
+| 维度 | 2026-08-24 当前本地运行 | 目标生产架构 |
+| --- | --- | --- |
+| 数据库 | SQLite 单文件 | PostgreSQL 18 |
+| 任务执行 | FastAPI `BackgroundTasks` + eager `TaskProcessor` | Redis/Celery worker |
+| 搜索 | NAS SearXNG | 同一 SearXNG 接口，可配置高可用 |
+| 网页抓取 | HTTPX + Playwright Chromium 回退 | 同一代码运行于 source worker |
+| 模型 | 局域网 OMLX，`Qwen3.8-27B-6bit`，全局并发 1 | 仍只使用该模型与全局串行队列，不扩展并发/批处理 |
+| 对象存储 | 本地文件系统 | S3 兼容对象存储 |
+| 运维状态 | 本地 API/Web 常驻，定时监视 | NAS 容器化、健康检查和备份 |
+
+后文如未特别标注，PostgreSQL、Redis/Celery、outbox、lease 和多 worker 表示目标架构；SQLite eager 路径是当前已验证的本地运行形态。
 
 ## 3. 规模与质量假设
 
@@ -32,7 +48,7 @@
 - 目标工作簿包含 11 个业务工作表。
 - 快速回归样本为 275 行。
 - 完整输入基线约 11,996 条活跃行。
-- 历史金标约 17,490 条活跃行。
+- 历史外部验收金标约 17,490 条活跃行，不属于平台运行输入。
 - 单个工作表既可能有大量已有行，也可能只有表头或一条样例行。
 - 同一任务可能同时包含逐行采集、完整快照构建、实体刷新、保留和结构化导入。
 
@@ -45,7 +61,7 @@
 - 不超过 500,000 个普通字段；
 - 不超过 100,000 个目标字段；
 - 任务运行时间允许从数分钟到数天；
-- 外部调用并发可按来源和模型分别限流。
+- 来源调用并发可按域名限流；OMLX 不是可调并发，固定全局为 1。
 
 数据库和对象存储按任务历史长期保留设计，不把完整正文塞入高频查询表。
 
@@ -61,8 +77,11 @@
 8. 来源发现、内容抓取、数据提取、标准化、校验和审核分层。
 9. 所有写操作幂等，所有状态转换检查预期版本。
 10. 大文件、大正文和生成产物进入对象存储。
-11. 异常优先审核，高质量结果支持受控批量确认。
+11. 异常优先审核，高质量结果支持版本化策略自动通过或受控批量确认。
 12. 系统建议、人工事实和导出快照分别保存。
+13. 执行、业务解决和审核状态正交建模，不以执行成功推导字段已解决。
+14. 每个 unit 必须独立完成可审计的来源获取路由：采集直链优先，只有无直链或直链失败、无目标数据、匹配歧义时才逐行搜索降级；不变 SourceSnapshot 可跨 unit 复用，行证据定位、校验与提交仍隔离。
+15. 模型请求不批处理、不并发；每行使用同一 Qwen3.8 固定串行执行候选综合和独立证据复核。
 
 ## 5. 系统上下文
 
@@ -89,6 +108,22 @@ flowchart LR
     Worker --> OMLX
     Worker --> Sources
 ```
+
+### 5.1 当前本地运行拓扑
+
+```mermaid
+flowchart LR
+    Browser[用户浏览器] --> Web[Vite/Vue :5173]
+    Web --> API[FastAPI :8000]
+    API --> SQLite[(metric-pulse-codex-run.db)]
+    API --> Processor[TaskProcessor eager]
+    Processor --> Search[NAS SearXNG\n10.0.0.7:8888]
+    Processor --> Public[公开网页/附件]
+    Processor --> Chromium[Playwright Chromium]
+    Processor --> OMLX[本地 OMLX\nQwen3.8-27B-6bit]
+```
+
+图中 API 进程与当前采集处理共生命周期，因此修改采集代码时必须先让任务进入 `PAUSED`，再重启 API。切换 Celery 后该限制转为“重启对应 worker”。
 
 ## 6. 运行时组件
 
@@ -223,6 +258,8 @@ Redis 数据丢失不应造成业务结果丢失。系统能够由 PostgreSQL ou
 - 确定性标准化；
 - 复合结果校验；
 - 评分和建议选择。
+- SourceAcquisitionAttempt 逐行路由、按需 RowSearchAttempt、SourceSnapshot 内容去重和 UnitSourceLink 行级定位；
+- 固定双阶段 Qwen3.8 调用、全局串行队列和阶段审计。
 
 ### 7.7 Dataset Snapshot
 
@@ -243,10 +280,11 @@ Redis 数据丢失不应造成业务结果丢失。系统能够由 PostgreSQL ou
 ### 7.9 Review
 
 - 待审核队列；
-- 批准、修正、驳回和跳过；
+- 自动通过、批准、修正、确认未解决、驳回和可选项跳过；
 - 字段覆盖值；
 - 版本冲突；
-- 批量审核；
+- ReviewPolicy、自动审核抽样和风险门槛；
+- 基于冻结筛选快照的批量审核；
 - 审核完成计算。
 
 ### 7.10 Export
@@ -286,6 +324,8 @@ flowchart TD
     Review --> Export
 ```
 
+`preserve` 分支只能由当次任务使用的已发布业务模板或用户授权显式选择。生产平台不能根据历史金标是否变化选择 `preserve`，运行时也不存在可供判断的金标。
+
 ### 8.2 RowContract
 
 RowContract 是不可变值对象，冻结：
@@ -316,7 +356,7 @@ metric_value_with_source =
 
 ### 8.4 Collection Unit
 
-`collection_unit` 状态：
+`collection_unit.execution_status` 只表示 worker 执行状态：
 
 ```text
 PENDING → LEASED → RUNNING → SUCCEEDED
@@ -327,6 +367,18 @@ PENDING → LEASED → RUNNING → SUCCEEDED
 ```
 
 `DISCARDED` 表示运行版本已过期、任务已停止或输入 contract 已失效，worker 结果不得成为当前建议值。
+
+业务结果另存 `resolution_status`：
+
+```text
+NOT_EVALUATED → RESOLVED
+              → PARTIAL
+              → UNRESOLVED
+              → CONFLICT
+              → INVALID
+```
+
+解决状态由目标组必需字段、证据充分性、契约匹配和确定性校验器计算；模型不直接决定。`SUCCEEDED` 且业务值为空的 unit 只能是 `UNRESOLVED/PARTIAL/CONFLICT/INVALID`，不得计入已解决覆盖率。
 
 ### 8.5 处理步骤
 
@@ -363,9 +415,14 @@ DRAFT → QUEUED → RUNNING → SUCCEEDED
 - `STOPPED` 是终态，重新运行必须创建新 `task_run`。
 - `PAUSED` 恢复时沿用当前 run，不重置已完成结果。
 - 任务状态不代表审核状态。
+- 任务状态也不代表业务解决状态。
 - `SUCCEEDED_WITH_ERRORS` 允许人工补充或针对失败 unit 创建新 run。
 
-### 9.2 审核状态
+### 9.2 业务解决状态
+
+`resolution_status` 使用 8.4 的枚举。任务聚合同时输出 `execution_counts`、`resolution_counts`和 `review_counts`，不用一个“完成数”混合三种口径。
+
+### 9.3 审核状态
 
 ```text
 NOT_READY → PENDING → IN_PROGRESS → COMPLETED
@@ -374,13 +431,19 @@ NOT_READY → PENDING → IN_PROGRESS → COMPLETED
 目标字段组审核状态：
 
 ```text
-UNREVIEWED → APPROVED
+UNREVIEWED → AUTO_APPROVED
+           → APPROVED
            → CORRECTED
+           → CONFIRMED_UNRESOLVED
            → REJECTED → 新的 collection unit
            → SKIPPED
 ```
 
-### 9.3 导出状态
+`AUTO_APPROVED` 必须保存 ReviewPolicy 版本、规则输入、命中理由和抽样结果。`CONFIRMED_UNRESOLVED` 表示人工确认当前无可靠值，导出可保留空值但必须在未解决报告中列出。`SKIPPED` 只能用于配置明确允许不纳入本次导出范围的可选项，不得规避必需结果。
+
+“已核对”是完成态指标，只统计 `AUTO_APPROVED/APPROVED/CORRECTED/CONFIRMED_UNRESOLVED/SKIPPED`。`REJECTED` 是触发重采的过程决定，不计入已核对；驳回历史保存在不可变审核决定中，重采开始时当前审核状态回到 `UNREVIEWED`，等待新结果再次审核。
+
+### 9.4 导出状态
 
 ```text
 BLOCKED → READY → GENERATING → AVAILABLE
@@ -489,14 +552,18 @@ worker 周期续租。scheduler 只恢复超过宽限期且 worker 心跳失联�
 | `dataset_runs` | task_run_id、dataset_id、mode、snapshot completeness、status |
 | `records` | dataset_run_id、business_key、source row、raw_data、fingerprint |
 | `row_contracts` | record_id、target_group、contract_json、contract_hash、versions |
-| `collection_units` | row_contract_id、task_run_id、status、lease、retry、current_candidate_set |
+| `collection_units` | row_contract_id、task_run_id、execution_status、resolution_status、reason_code、lease、retry、current_candidate_set |
+| `row_search_attempts` | unit_id、query、source_policy_version、started/finished_at、ordered results、status |
+| `source_snapshots` | normalized_url、etag/last_modified、content_hash、raw/text object key、parse status |
+| `unit_source_links` | unit_id、search/source snapshot id、locator、contract match score、purpose |
 | `collection_attempts` | unit_id、step、status、input/output refs、model、timing、error |
 | `evidence_documents` | source URL、object key、content hash、metadata、retention |
 | `evidence_fragments` | document_id、locator、text、fragment hash |
 | `candidate_sets` | unit_id、algorithm version、selected candidate、score summary |
 | `candidates` | candidate_set_id、values JSONB、validation、score、reason |
 | `candidate_evidence` | candidate_id、fragment_id、field path、relation |
-| `review_decisions` | unit_id、version、decision、field overrides、actor、comment |
+| `review_policies` | version、risk predicates、allowed decisions、sampling rule、published_at |
+| `review_decisions` | unit_id、version、decision、policy_version/actor、field overrides、comment |
 | `final_values` | unit_id、review decision、values JSONB、version、effective_at |
 | `export_jobs` | task_id、review snapshot version、status、object key、hash |
 | `task_events` | task_id、sequence、type、payload、created_at |
@@ -585,6 +652,16 @@ class SourceAdapter(Protocol):
 - 用户上传文档；
 - 内部结构化文件。
 
+#### 12.1.1 直链优先与 SearXNG 降级契约
+
+- `build_search_query()` 从当前行的指标/实体、地域、日期、行业和单位确定性构造查询；
+- 工作簿内已有采集直链时，先执行 URL 规范化、SSRF 校验、获取、解析和 RowContract 唯一匹配；唯一匹配且包含目标字段时直接形成证据，不调用搜索；
+- 无直链，或直链获取失败、目标缺失、匹配歧义时，记录原因并调用 SearXNG JSON 接口，语言 `zh-CN`，safesearch=0，限制前 10 条有效公网 URL；
+- 搜索全局串行，两次搜索开始至少间隔 60 秒，最多 3 次并以 60/120 秒退避；
+- 搜索摘要只是低置信线索，网页正文、文档内容或渲染图像才是主证据。
+
+每行必须保存 `SourceAcquisitionAttempt`。`RowSearchAttempt` 只在实际搜索降级时存在。GitHub `blob` 等已知展示 URL 应规范化为可下载资源，同时保存输入、规范化和最终 URL。
+
 ### 12.2 抓取安全
 
 - 只允许 `http/https`；
@@ -594,6 +671,28 @@ class SourceAdapter(Protocol):
 - 内容类型白名单；
 - 禁止将 OMLX 内网地址通过用户输入传入通用抓取器；
 - OMLX endpoint 只能来自管理员配置。
+
+#### 12.2.1 HTTP 与浏览器回退决策
+
+```mermaid
+flowchart TD
+    Candidate[候选 URL] --> Validate[公网 DNS/SSRF 验证]
+    Validate --> HTTP[HTTPX GET，25s，最多 20MB]
+    HTTP --> Kind{内容类型}
+    Kind -->|PDF/DOCX/DOC/Image/Text| Native[确定性提取]
+    Kind -->|HTML| Main[主文去噪]
+    HTTP -->|403/406/408/409/425/429/5xx\n或传输失败| Fallback[Chromium 回退]
+    Main --> Thin{主文 < 500\n或挑战特征?}
+    Thin -->|是| Fallback
+    Thin -->|否| Evidence[文本 + 图片证据]
+    Fallback --> Route[顶层导航逐次 SSRF 校验]
+    Route --> Render[DOM load + 最多 15s networkidle + 5s 稳定]
+    Render --> Challenge{验证码/挑战/登录受限?}
+    Challenge -->|是| Reject[清空正文/图像，保留原 URL 和错误]
+    Challenge -->|否| Evidence
+```
+
+回退列表排除 PDF、Office、图片、表格文件和压缩包后缀，这些内容继续使用确定性下载/解析。浏览器不解决验证码、不注入隐身脚本、不保留登录会话，只用于正常公开网页的 JavaScript 渲染。
 
 ### 12.3 OMLX Gateway
 
@@ -614,16 +713,35 @@ class ModelGateway(Protocol):
 
 请求包含：
 
-- model alias；
+- 固定 model ID `Qwen3.8-27B-6bit`（可在启动时验证实际 ID，但不做运行时选型或降级）；
 - system prompt version；
 - user prompt；
 - JSON Schema；
 - timeout；
 - trace metadata。
 
-`MediaAnalysisRequest` 额外包含受控图片对象、MIME、像素尺寸、分片坐标和图像哈希。启动时对模型 alias 执行能力探测，验证图像输入、结构化输出、超时和最大输入约束；未通过时禁用视觉自动识别并显式告警。
+`MediaAnalysisRequest` 额外包含受控图片对象、MIME、像素尺寸、分片坐标和图像哈希。启动时对固定模型执行能力探测，验证实际 ID、图像输入、结构化输出、超时和最大输入约束；未通过时停止新采集并显式告警，不切换其他模型。
 
 网关负责鉴权、超时、并发、错误归一化和响应过滤，不把 API key 写入日志。
+
+#### 12.3.1 固定双阶段证据综合
+
+```mermaid
+flowchart LR
+    Docs[编号来源文本\n最多 30,000 字符] --> First[第一次 OMLX\n综合候选]
+    Vision[联系表\n最多 6 图] --> First
+    First --> Candidate[候选 values/source_indices/conflicts]
+    Docs --> Audit[第二次 OMLX\n独立证据审核]
+    Vision --> Audit
+    Candidate --> Audit
+    Audit --> Gate{日期、地域、口径、\n单位及直接证据匹配?}
+    Gate -->|是| Approved[批准/纠正值]
+    Gate -->|否| Empty[业务值置 null\n保留理由与冲突]
+```
+
+地域校验失败关闭：城市值不能满足省级目标，省/市/公司子集不能满足国家目标，单国不能满足全球目标。一个数字即使很显眼，只要统计期、指标定义、总体或单位不符，就不得通过。
+
+上图同时是当前实现事实和目标质量契约。`First` 和 `Audit` 都调用同一 `Qwen3.8-27B-6bit`，但是两个串行的独立请求；第二次不复用第一次对话会话。每个 unit 必须完成两次调用，包括结构化来源的行。OMLX 全局并发固定为 1，不允许多行批处理。
 
 ### 12.4 模型使用边界
 
@@ -665,7 +783,7 @@ class ModelGateway(Protocol):
 
 ### 12.6 图片证据识别
 
-新系统不将 Tesseract + 灰度/二值化作为图片理解主路径。原图经安全检查、尺寸限制和必要分片后发送到本地视觉模型，输出必须通过任务 JSON Schema。证据保存原图 hash、分片坐标、模型 alias/实际版本、量化、Prompt 版本、原始受控响应和解析结果。
+新系统不将 Tesseract + 灰度/二值化作为图片理解主路径。原图经安全检查、尺寸限制和必要分片后发送到本地视觉模型，输出必须通过任务 JSON Schema。证据保存原图 hash、分片坐标、固定模型实际 ID/版本、量化、Prompt 版本、原始受控响应和解析结果。
 
 如视觉能力不可用，图片证据标记为 `MEDIA_RECOGNITION_UNAVAILABLE`，改用 HTML 可访问文本、替代来源或人工核对；不得在无告警的情况下当作“图片中没有数据”。
 
@@ -767,20 +885,22 @@ class ModelGateway(Protocol):
 - 每用户 API 限流；
 - 每 workspace 同时运行任务数；
 - 每来源域名并发和 QPS；
-- OMLX 全局并发；
+- OMLX 全局并发固定为 1；
 - 文档解析并发；
 - 单任务预算。
 
 ### 16.2 缓存
 
-- 搜索结果按规范化查询、来源策略和时间窗口缓存；
+- 搜索结果不跨行缓存或复用；只有进入 `SEARCH_FALLBACK` 的 unit 建立自己的 `RowSearchAttempt` 并实际调用 SearXNG；
 - 抓取内容按 URL + ETag/Last-Modified + content hash 缓存；
-- 模型结果只在 RowContract、证据 hash、提示词版本、模型 alias 和规则版本全部相同时复用；
+- `SourceSnapshot` 保存原文、解析文本、结构化索引、媒体引用和哈希，`UnitSourceLink` 保存行级引用与定位；同 URL/同内容可避免重复下载和解析，但每行仍须独立建立证据切片和契约匹配；
+- 模型结果不用于跳过新行的两次调用；缓存只可作诊断/对照，不作为新 unit 的正式结果；
+- OMLX 前缀缓存只作机会性性能优化并记录命中指标，业务正确性不得依赖缓存；关闭缓存必须得到相同业务结果；
 - 人工审核结果复用必须由模板策略明确允许。
 
-### 16.3 批处理
+### 16.3 非模型批量操作
 
-数据库批量插入 records 和 contracts，但模型上下文保持逐行隔离。
+数据库可批量插入 records 和 contracts，同一行的 HTTP 候选可在域级限流下并发抓取。相同来源可相邻调度以提高快照和 OMLX 前缀缓存命中，但不得改变行优先级或共享会话。搜索降级必须逐行发起，模型每次只处理一行并全局串行。
 
 可把多个 unit 放入同一 Celery 消息降低队列开销，但 worker 必须逐个领取、记录和提交，单个失败不回滚整个批次。
 
@@ -812,10 +932,14 @@ class ModelGateway(Protocol):
 - 每来源成功率和延迟；
 - OMLX 延迟、错误和并发；
 - 文本/视觉请求队列深度、识别耗时和能力探测状态；
-- 工作簿识别自动接受率、冲突率、人工修正率和金标回归结果；
+- 工作簿识别自动接受率、冲突率、人工修正率，以及 CI/外部验收系统发布的质量摘要；
 - 候选覆盖率；
 - 证据覆盖率；
-- 审核耗时和修正率；
+- 执行状态计数与失败/重试率；
+- `RESOLVED/PARTIAL/UNRESOLVED/CONFLICT/INVALID` 业务覆盖率；
+- 直链成功率、搜索降级率与原因、每行搜索请求数、URL/内容缓存命中率、下载/解析数，以及 OMLX `SYNTHESIZE/VERIFY` 调用数；
+- OMLX 队列等待时间、推理耗时和实测在途并发（必须始终 `<= 1`）；
+- 审核耗时、自动通过率、抽样错误率、人工修正率和确认未解决率；
 - 导出失败率。
 
 ### 17.3 健康检查
@@ -840,6 +964,8 @@ postgres
 redis
 object-storage（可选，若使用外部 KS3 则不部署）
 ```
+
+当前 `compose.yaml` 实际定义 `postgres` / `redis` / `migrate` / `api` / `worker` / `web`，并不按 workbook/source/vision/collection 拆成多个 worker 容器。上述多 worker 名称是随规模扩容的目标拆分，不应作为当前部署事实。Docker 镜像已安装 `antiword` 和 Playwright Chromium，并将浏览器文件放入非 root 用户可读的共享路径。
 
 ### 18.2 NAS 网络
 
@@ -909,6 +1035,9 @@ object-storage（可选，若使用外部 KS3 则不部署）
 - 候选评分；
 - readiness；
 - Excel 公式注入防护。
+- HTML 主文去噪、PDF 渲染页、DOCX 表格/图片和视觉联系表；
+- 403/短正文浏览器回退判定、二进制文件排除和挑战页识别；
+- 状态聚合前 flush，以及单元转 RUNNING 时统计立即可见。
 
 ### 20.2 属性测试
 
@@ -930,12 +1059,14 @@ object-storage（可选，若使用外部 KS3 则不部署）
 - SSRF 和下载限制；
 - OMLX 图像输入、结构化响应和能力探测合约；
 - 工作簿渲染、分片坐标和识别融合门禁。
+- 公开 JavaScript 测试页能由 Chromium 恢复静态 HTTP 中不存在的正文并生成截图；
+- 微信验证码重定向被识别为受限，保留原始 URL，不将挑战文本/图像作为证据。
 
 ### 20.4 端到端
 
 - 275 行快速回归；
-- 275 行文件的结构/视觉识别及变体金标回归；
-- 11,996 → 17,490 历史金标离线回归；
+- 275 行文件的结构/视觉识别及外部变体测试集回归；
+- 平台在无金标权限环境运行完成后，由独立进程执行 11,996 → 17,490 历史金标离线比较；
 - 暂停、恢复和停止；
 - 并发启动；
 - 审核冲突；
@@ -943,6 +1074,32 @@ object-storage（可选，若使用外部 KS3 则不部署）
 - 原工作簿回填和格式验证。
 
 ## 21. 实施阶段
+
+共同前置门禁：在 P0-3 数据迁移前，将现有 `gold collector`、金标配置与对照逻辑移出平台生产包和运行时，改由独立验收包负责，并用 CI 扫描锁定边界。该门禁不是第四个 P0 阶段。
+
+### P0-3：状态语义（第一顺位）
+
+- 增加 execution/resolution/review 三套正交状态、原因码和分类聚合；
+- 保守迁移旧数据，无法确定的旧结果标记 `NOT_EVALUATED`；
+- 同步 API、Web、审核队列、导出 readiness 和指标；
+- 用真值表测试锁定 `SUCCEEDED + null`、冲突、驳回重采和导出语义。
+
+### P0-2：吞吐与可恢复性（第二顺位）
+
+- 建立行属于的 `SourceAcquisitionAttempt`、按需 `RowSearchAttempt`、可复用 `SourceSnapshot`、`UnitSourceLink` 和 URL/内容去重；直链优先，搜索仅作降级且响应不跨行复用；
+- 将 discover/fetch/parse/synthesize/verify/validate 拆为可续跑阶段，记录幂等键、attempt、lease、heartbeat、`next_attempt_at` 和资源上限；
+- 固定 `Qwen3.8-27B-6bit`、OMLX 全局并发 1、一次请求一行，并对每行固定执行两次串行请求；
+- 优化相同来源抓取、URL/内容缓存、结构化索引与证据切片复用和恢复扫描，禁止跨行会话、模型批处理、并发或减少调用次数；
+- 旧 run 保持只读可追溯，新建任务走新管线，不就地篡改历史证据。
+
+### P0-4：异常审核效率（第三顺位）
+
+- 建立版本化 `ReviewPolicy`、`AUTO_APPROVED` 审计记录与风险抽样；
+- 审核队列默认只展示需人工决策的异常；
+- 批量操作使用冻结筛选快照、预览影响集、expected version 和逐行结果；
+- 实现 `CONFIRMED_UNRESOLVED` 与正式导出附带的未解决报告。
+
+上述三步通过验收后，再继续以下整体建设阶段。
 
 ### 阶段 A：工程与可靠底座
 
@@ -983,7 +1140,7 @@ object-storage（可选，若使用外部 KS3 则不部署）
 
 - 历史结果复用；
 - 权威来源适配器；
-- 完整金标回归；
+- 独立外部金标回归；
 - 旧数据迁移；
 - NAS 正式切换。
 
@@ -994,23 +1151,26 @@ object-storage（可选，若使用外部 KS3 则不部署）
 | openpyxl 无法完全保留高级 Excel 特性 | 用真实文件回归；建立 WorkbookEngine 端口；必要时引入 LibreOffice 辅助 |
 | Celery 消息和数据库状态不一致 | outbox、幂等消费、lease 和恢复扫描 |
 | 通用搜索质量低、人工仍多 | 优先建设权威来源适配器和历史审核安全复用 |
-| 模型结果格式和质量波动 | JSON Schema、提示词版本、确定性校验、黄金数据集 |
+| 模型结果格式和质量波动 | JSON Schema、提示词版本、确定性校验、独立外部回归集 |
 | 多模态模型幻觉单元格坐标或字段角色 | OOXML 事实层交叉校验，关键冲突强制人工确认 |
-| 视觉请求占满本地 OMLX | 交互/批处理分类队列、全局并发上限、已发布模板快速路径 |
+| 视觉请求占满本地 OMLX | 单一全局串行队列、固定并发 1、显示排队与 ETA；不通过批处理或并发规避 |
 | 任务暂停/停止后迟到写入 | run version、提交前状态检查、DISCARDED 状态 |
 | 数据量增大导致审核页面变慢 | 服务端分页、字段摘要、正文按需加载、索引和只读投影 |
-| 旧需求两套口径冲突 | 把预览产物和正式导出分开；正式导出始终受审核门禁控制 |
+| 旧需求两套口径冲突 | 把预览产物和正式导出分开；正式导出始终受可审计的自动/人工审核门禁控制 |
 
-## 23. 系统设计完成条件
+## 23. 下一阶段生产切换条件
 
-在进入全面编码前，应完成：
+当前已进入全量本地采集阶段。在 NAS/生产切换前，应完成：
 
 1. 本文和 ADR 评审通过；
 2. 领域状态机测试样例确认；
 3. 核心 ER 模型和索引评审；
 4. OpenAPI 第一版冻结；
-5. 275 行和完整金标 Fixture 的合法使用与存储方式确认；
+5. 冻结原始来源 Fixture 的合法使用与存储方式确认，并证明其未从金标反向生成；
 6. NAS 上 PostgreSQL、Redis、worker、对象存储和 OMLX 连通性刺探；
 7. Excel 保真度刺探；
-8. OMLX 视觉合约、275 行/变体金标和识别融合门禁刺探；
-9. 正式导出严格门禁和 `SKIPPED` 语义确认。
+8. OMLX 视觉合约、275 行结构变体和识别融合门禁刺探；
+9. P0-3、P0-2、P0-4 按顺序完成，正式导出验证 `AUTO_APPROVED`、`CONFIRMED_UNRESOLVED` 和可选项 `SKIPPED` 语义；
+10. 全量在线任务完成，对浏览器回退、挑战页、证据充分率和 `null` 率进行分 Sheet 抽样；
+11. PostgreSQL/Redis/Celery 切换后重跑暂停、恢复、迟到结果和统计一致性验收。
+12. 平台运行完成后由独立进程执行金标比较，并通过生产包/配置扫描证明平台无金标依赖。

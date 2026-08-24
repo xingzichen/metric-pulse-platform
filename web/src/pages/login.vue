@@ -3,12 +3,15 @@ import { reactive, ref } from "vue";
 import { useRoute, useRouter } from "vue-router";
 import { ElMessage } from "element-plus";
 import { useAuth } from "../stores/auth";
+
+// 登录成功后回到路由守卫保存的原目标页，避免深链接操作被中断。
 const form = reactive({ username: "admin", password: "" });
 const busy = ref(false);
 const auth = useAuth();
 const router = useRouter();
 const route = useRoute();
 async function submit() {
+  // busy 同时阻止重复提交，并为慢速或失败请求提供明确反馈。
   busy.value = true;
   try {
     await auth.login(form.username, form.password);

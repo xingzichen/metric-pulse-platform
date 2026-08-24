@@ -5,6 +5,8 @@ import { useQuery } from "@tanstack/vue-query";
 import { ElMessage } from "element-plus";
 import { api, post } from "../../api";
 import type { AnalysisSheet, Dataset, FileItem, Task } from "../../types";
+
+// 创建页把文件识别建议转换成可编辑的任务数据集配置，提交后由后端冻结行契约。
 const route = useRoute();
 const router = useRouter();
 const form = reactive<{
@@ -31,6 +33,7 @@ watch(
   () => detail.data.value?.analysis,
   (analysis) => {
     if (!analysis) return;
+    // 只为存在目标字段的工作表创建采集计划，仍允许用户在提交前调整字段角色。
     form.datasets = analysis.sheets
       .filter((x: AnalysisSheet) => x.target_fields.length)
       .map((x: AnalysisSheet) => ({
@@ -54,6 +57,7 @@ async function submit() {
 }
 </script>
 <template>
+  <!-- 配置按工作表折叠，避免多表文件一次铺开造成操作负担。 -->
   <div class="page-head">
     <div>
       <h1>创建采集任务</h1>

@@ -5,6 +5,8 @@ import { ElMessage } from "element-plus";
 import { api, post } from "../../api";
 import type { FileItem } from "../../types";
 import StatusTag from "../../components/StatusTag.vue";
+
+// 模板引用已识别文件的稳定结构；创建新版本与发布为两个显式步骤。
 const dialog = ref(false),
   name = ref(""),
   fileId = ref("");
@@ -24,11 +26,13 @@ async function create() {
   ElMessage.success("模板版本已创建");
 }
 async function publish(id: string) {
+  // 发布后刷新列表，使同名模板的版本状态以服务端结果为准。
   await post(`/api/v1/templates/${id}/publish`);
   await qc.invalidateQueries({ queryKey: ["templates"] });
 }
 </script>
 <template>
+  <!-- 模板仅减少重复配置，不携带任何测试对照数据或所谓金标语义。 -->
   <div class="page-head">
     <div>
       <h1>模板中心</h1>

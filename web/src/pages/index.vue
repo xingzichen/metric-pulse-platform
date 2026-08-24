@@ -3,6 +3,9 @@ import { useQuery } from "@tanstack/vue-query";
 import { api } from "../api";
 import type { FileItem, Task } from "../types";
 import StatusTag from "../components/StatusTag.vue";
+import { completedReviewCount, pendingReviewCount } from "../task-stats";
+
+// 工作台聚合任务与文件两个接口；任务短轮询用于及时反映后台串行采集进度。
 const tasks = useQuery({
   queryKey: ["tasks"],
   queryFn: () => api<{ items: Task[] }>("/api/v1/tasks"),
@@ -14,6 +17,7 @@ const files = useQuery({
 });
 </script>
 <template>
+  <!-- 顶部指标帮助操作者优先发现正在执行和等待人工核对的工作。 -->
   <div class="page-head">
     <div>
       <h1>工作台</h1>
@@ -40,7 +44,7 @@ const files = useQuery({
       <span class="muted">待核对</span
       ><b>{{
         tasks.data.value?.items.reduce(
-          (n, x) => n + (x.stats.succeeded || 0) - (x.stats.reviewed || 0),
+          (n, x) => n + pendingReviewCount(x.stats),
           0,
         ) ?? 0
       }}</b>
@@ -74,7 +78,11 @@ const files = useQuery({
                   )
                 : 0
             " /></template></el-table-column
-      ><el-table-column prop="stats.reviewed" label="已核对" /><el-table-column
+      ><el-table-column label="已核对"
+        ><template #default="s">{{
+          completedReviewCount(s.row.stats)
+        }}</template></el-table-column
+      ><el-table-column
         prop="updatedAt"
         label="更新时间"
         min-width="180" /></el-table

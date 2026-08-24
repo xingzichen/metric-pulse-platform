@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+
 from openpyxl import load_workbook
 
+from metric_pulse import main as main_module
 from tests.conftest import EMPTY_WORKBOOK, GOLD_WORKBOOK, TEST_ROOT
 
 
@@ -42,7 +45,9 @@ def test_upload_collect_review_and_export_real_fixture(client) -> None:
     )
     assert response.status_code == 201, response.text
     task = response.json()
-    assert task["stats"]["total"] >= 150
+    # The production planner sees only the uploaded template. Expected-workbook
+    # rows are deliberately unavailable and therefore cannot expand this task.
+    assert task["stats"]["total"] == 1
 
     response = client.post(
         f"/api/v1/tasks/{task['id']}/start",
@@ -65,9 +70,15 @@ def test_upload_collect_review_and_export_real_fixture(client) -> None:
         if offset >= page["total"]:
             break
     for start in range(0, len(units), 200):
-        response = client.post(
-            f"/api/v1/tasks/{task['id']}/reviews/bulk",
+        preview = client.post(
+            f"/api/v1/tasks/{task['id']}/reviews/bulk/preview",
             json={"unit_ids": [item["id"] for item in units[start : start + 200]]},
+        )
+        assert preview.status_code == 200, preview.text
+        assert preview.json()["eligible"] == len(units[start : start + 200])
+        response = client.post(
+            f"/api/v1/tasks/{task['id']}/reviews/bulk/commit",
+            json={"preview_token": preview.json()["previewToken"]},
         )
         assert response.status_code == 200, response.text
 
@@ -85,7 +96,7 @@ def test_upload_collect_review_and_export_real_fixture(client) -> None:
     actual_path.parent.mkdir(parents=True, exist_ok=True)
     actual_path.write_bytes(download.content)
     actual = load_workbook(actual_path, read_only=True, data_only=False)
-    for row in (3, 20, 100, 300):
+    for row in (3,):
         for column in (4, 5, 6, 10):
             assert (
                 actual[target_sheet["name"]].cell(row, column).value
@@ -93,3 +104,34 @@ def test_upload_collect_review_and_export_real_fixture(client) -> None:
             )
     actual.close()
     source.close()
+
+
+def test_vision_preflight_failure_is_persisted_for_every_sheet(client, monkeypatch) -> None:
+    async def unavailable(_self):
+        raise RuntimeError("provider rejected credentials")
+
+    monkeypatch.setattr(main_module.settings, "vision_analysis_enabled", False)
+    with EMPTY_WORKBOOK.open("rb") as handle:
+        response = client.post(
+            "/api/v1/files",
+            files={
+                "upload": (
+                    EMPTY_WORKBOOK.name,
+                    handle,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
+            },
+        )
+    assert response.status_code == 201, response.text
+    file_id = response.json()["id"]
+
+    monkeypatch.setattr(main_module.settings, "vision_analysis_enabled", True)
+    monkeypatch.setattr(main_module.OMLXClient, "health", unavailable)
+    asyncio.run(main_module.vision_recognize_file(file_id))
+
+    detail = client.get(f"/api/v1/files/{file_id}")
+    assert detail.status_code == 200, detail.text
+    sheets = detail.json()["analysis"]["sheets"]
+    assert sheets
+    assert all(sheet["vision"]["valid"] is False for sheet in sheets)
+    assert all("OMLX preflight failed" in sheet["vision"]["error"] for sheet in sheets)

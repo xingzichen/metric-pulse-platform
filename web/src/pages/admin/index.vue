@@ -4,6 +4,8 @@ import { useQuery, useQueryClient } from "@tanstack/vue-query";
 import { ElMessage } from "element-plus";
 import { api, post } from "../../api";
 import type { User } from "../../types";
+
+// 管理页并列展示账号、唯一模型服务健康度与审计日志，仅对 ADMIN 路由开放。
 const tab = ref("users");
 const qc = useQueryClient();
 const users = useQuery({
@@ -20,6 +22,13 @@ const health = useQuery({
 });
 const dialog = ref(false);
 const form = reactive({ username: "", password: "", role: "VIEWER" });
+const roleLabels: Record<string, string> = {
+  // 数据库保留稳定角色码，界面统一转换为面向管理员的中文名称。
+  VIEWER: "只读用户",
+  OPERATOR: "任务操作员",
+  REVIEWER: "审核员",
+  ADMIN: "管理员",
+};
 async function create() {
   await post("/api/v1/admin/users", form);
   dialog.value = false;
@@ -28,6 +37,7 @@ async function create() {
 }
 </script>
 <template>
+  <!-- 各标签页独立读取数据，创建用户后只失效账号列表缓存。 -->
   <div class="page-head">
     <div>
       <h1>系统管理</h1>
@@ -43,10 +53,11 @@ async function create() {
         >创建用户</el-button
       ><el-table :data="users.data.value?.items"
         ><el-table-column prop="username" label="用户名" /><el-table-column
-          prop="role"
-          label="角色" /><el-table-column
-          prop="id"
-          label="ID" /></el-table></el-tab-pane
+          label="角色"
+          ><template #default="scope">{{
+            roleLabels[scope.row.role] || "未知角色"
+          }}</template></el-table-column
+        ><el-table-column prop="id" label="ID" /></el-table></el-tab-pane
     ><el-tab-pane label="本地模型" name="model"
       ><el-card class="card"
         ><el-result
@@ -79,6 +90,7 @@ async function create() {
           ><el-option
             v-for="r in ['VIEWER', 'OPERATOR', 'REVIEWER', 'ADMIN']"
             :key="r"
+            :label="roleLabels[r]"
             :value="r" /></el-select></el-form-item></el-form
     ><template #footer
       ><el-button @click="dialog = false">取消</el-button

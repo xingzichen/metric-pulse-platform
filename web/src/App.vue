@@ -8,6 +8,8 @@ import {
 } from "@element-plus/icons-vue";
 import { useRouter } from "vue-router";
 import { useAuth } from "./stores/auth";
+
+// 根组件只负责登录页分流、全局导航与退出；业务数据全部留在各功能页面中。
 const auth = useAuth();
 const router = useRouter();
 async function logout() {
@@ -17,6 +19,7 @@ async function logout() {
 </script>
 
 <template>
+  <!-- 登录页不使用后台框架；其余受保护页面共享侧栏和当前账号信息。 -->
   <router-view v-if="$route.path === '/login'" />
   <el-container v-else class="shell">
     <el-aside width="226px" class="sidebar">

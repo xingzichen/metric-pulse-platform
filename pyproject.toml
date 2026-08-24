@@ -5,16 +5,21 @@ description = "Excel-oriented intelligent collection, review and export platform
 requires-python = ">=3.14,<3.15"
 dependencies = [
   "alembic>=1.16,<2",
+  "beautifulsoup4>=4.13,<5",
   "boto3>=1.40,<2",
   "celery[redis]>=5.5,<6",
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
   "openpyxl>=3.1.5,<4",
   "pillow>=11,<13",
+  "playwright>=1.55,<2",
   "psycopg[binary]>=3.2,<4",
+  "pymupdf>=1.26,<2",
   "pydantic-settings>=2.10,<3",
+  "python-docx>=1.2,<2",
   "python-multipart>=0.0.20,<1",
   "sqlalchemy>=2.0.41,<3",
+  "trafilatura>=2.0,<3",
   "uvicorn[standard]>=0.35,<1",
 ]
 
@@ -51,4 +56,5 @@ line-length = 110
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
-ignore = ["B008"]
+# 中文文档字符串和注释使用全角标点；RUF002/RUF003 只检查标点形态，不影响代码安全。
+ignore = ["B008", "RUF002", "RUF003"]

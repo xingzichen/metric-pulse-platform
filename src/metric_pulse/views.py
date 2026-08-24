@@ -1,3 +1,9 @@
+"""ORM 对象到前端 JSON 视图的稳定映射。
+
+集中处理 snake_case 到 camelCase、枚举字符串化和详情字段展开，避免不同路由对同一资源
+返回不同语义。视图函数不提交事务，也不触发业务操作。
+"""
+
 from __future__ import annotations
 
 from typing import Any
@@ -7,6 +13,8 @@ from .state_machine import allowed_actions
 
 
 def file_view(file: FileRecord, *, include_analysis: bool = False) -> dict[str, Any]:
+    """序列化文件摘要；体积较大的分析 JSON 只在详情接口返回。"""
+
     result = {
         "id": file.id,
         "originalName": file.original_name,
@@ -23,6 +31,8 @@ def file_view(file: FileRecord, *, include_analysis: bool = False) -> dict[str, 
 
 
 def sheet_view(sheet: WorkbookSheet) -> dict[str, Any]:
+    """序列化工作表字段角色和置信度。"""
+
     return {
         "id": sheet.id,
         "name": sheet.name,
@@ -43,6 +53,8 @@ def sheet_view(sheet: WorkbookSheet) -> dict[str, Any]:
 
 
 def task_view(task: CollectionTask, *, detail: bool = False) -> dict[str, Any]:
+    """序列化任务统计、运行版本、控制版本及当前可用操作。"""
+
     result = {
         "id": task.id,
         "name": task.name,
@@ -61,12 +73,20 @@ def task_view(task: CollectionTask, *, detail: bool = False) -> dict[str, Any]:
 
 
 def unit_view(unit: CollectionUnit, *, detail: bool = False) -> dict[str, Any]:
+    """序列化执行/解决/审核三套状态；详情额外展开源行与行契约。"""
+
     result = {
         "id": unit.id,
         "taskId": unit.task_id,
         "recordId": unit.record_id,
         "status": unit.status,
+        "executionStatus": unit.status,
+        "resolutionStatus": unit.resolution_status,
+        "resolutionReason": unit.resolution_reason,
         "reviewStatus": unit.review_status,
+        "reviewRequired": unit.review_required,
+        "riskLevel": unit.risk_level,
+        "validationVersion": unit.validation_version,
         "targetFields": unit.target_fields,
         "suggestion": unit.suggestion,
         "finalValues": unit.final_values,

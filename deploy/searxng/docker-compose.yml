@@ -1,0 +1,14 @@
+services:
+  searxng:
+    image: docker.io/searxng/searxng:latest
+    container_name: metric-pulse-searxng
+    restart: unless-stopped
+    ports:
+      - "8888:8080"
+    environment:
+      SEARXNG_BASE_URL: http://10.0.0.7:8888/
+      UWSGI_WORKERS: "2"
+      UWSGI_THREADS: "2"
+    volumes:
+      - ./config:/etc/searxng:rw
+      - ./data:/var/cache/searxng:rw

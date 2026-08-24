@@ -5,6 +5,8 @@ import { ElMessage } from "element-plus";
 import { api } from "../../api";
 import type { FileItem } from "../../types";
 import StatusTag from "../../components/StatusTag.vue";
+
+// 文件上传使用 FormData 保留原始 xlsx；识别完成后仅刷新文件查询缓存。
 const queryClient = useQueryClient();
 const uploading = ref(false);
 const query = useQuery({
@@ -27,6 +29,7 @@ async function upload(options: { file: File }) {
 }
 </script>
 <template>
+  <!-- 上传区承担入口操作，下方列表用于进入结构识别结果而不是直接启动采集。 -->
   <div class="page-head">
     <div>
       <h1>文件与识别</h1>

@@ -1,0 +1,41 @@
+use_default_settings: true
+
+general:
+  instance_name: "Metric Pulse SearXNG"
+
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: "__SEARXNG_SECRET__"
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: false
+  image_proxy: true
+
+# Use a diverse keyless engine pool so a CAPTCHA or rate limit from one provider
+# does not turn a Metric Pulse collection unit into an empty search.
+engines:
+  - name: 360search
+    disabled: false
+  - name: baidu
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: google
+    disabled: true
+  - name: mojeek
+    disabled: false
+  - name: qwant
+    disabled: true
+  - name: sogou
+    disabled: false
+  - name: startpage
+    disabled: true
+  - name: brave
+    disabled: true
+  - name: duckduckgo
+    disabled: true

@@ -4,9 +4,9 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 文档版本 | v1.1 |
-| 状态 | 应用设计基线草案 |
-| 更新日期 | 2026-08-23 |
+| 文档版本 | v1.4 |
+| 状态 | 当前实现同步稿 + 已批准 P0 交互目标 |
+| 更新日期 | 2026-08-24 |
 | 覆盖范围 | Python 后端应用、Web 前端、API、主要用例和交互 |
 
 ## 2. 应用目标
@@ -16,11 +16,32 @@
 1. 上传工作簿；
 2. 确认自动识别的采集方案；
 3. 启动并控制任务；
-4. 主要核对异常和低置信度结果；
-5. 快速确认高质量结果；
-6. 在全部纳入导出的数据审核完成后下载正式工作簿。
+4. 主要核对异常、冲突和低置信度结果；
+5. 让低风险且经确定性验证的结果按版本化策略自动通过，必要时对高质量结果受控批量确认；
+6. 对已尽调查但无法安全填值的项直接“确认未解决”，无需伪造值；
+7. 在全部纳入导出的数据通过审核门禁后下载正式工作簿和未解决报告。
 
 应用不得要求用户理解队列、worker、模型 prompt、数据库表或复杂状态机。
+
+交互上必须明确区分“系统是否执行完成”、“业务数据是否已解决”和“审核门禁是否已满足”，不能以一个“完成”误导用户。
+
+### 2.1 当前已交付界面
+
+```mermaid
+flowchart LR
+    Login[登录] --> Home[工作台]
+    Home --> Files[文件列表/分析预览]
+    Files --> NewTask[新建任务]
+    Home --> Tasks[任务列表]
+    Tasks --> Detail[任务详情\n2 秒轮询]
+    Detail --> Control[启动/暂停/恢复/停止]
+    Detail --> Review[逐行核对]
+    Detail --> Export[导出中心]
+    Home --> Templates[模板]
+    Home --> Admin[用户/OMLX 健康/审计]
+```
+
+当前 Web 已实现上述页面和 API 闭环。任务详情目前每 2 秒轮询，SSE 端点已存在但前端尚未把其作为主更新通道。核对页已能显示原始行、校验 JSON、审核历史、建议值、来源摘录和决策按钮；更精细的浏览器回退标识和视觉证据预览属于后续 UI 增强。
 
 ## 3. 信息架构
 
@@ -432,6 +453,8 @@ POST /api/v1/tasks
 - 风险和未确认项；
 - “创建后立即启动”。
 
+`preserve` 只能是当次业务模板或用户授权的显式选择；UI 不显示、不接收也不推断任何金标信息。选择页只说明“保留本次输入现有值”，不出现“与期望表一致”等验收语义。
+
 存在阻断异常时不能启动。
 
 ## 10. 任务列表
@@ -442,6 +465,7 @@ POST /api/v1/tasks
 - 原文件；
 - 创建人；
 - 执行状态；
+- 业务解决状态；
 - 审核状态；
 - 导出状态；
 - 行进度和目标组进度；
@@ -480,12 +504,15 @@ POST /api/v1/tasks
 
 ### 11.1 概览卡片
 
-- 执行、审核和导出三种状态；
+- 执行、业务解决、审核和导出四种状态；
 - 行数和目标组数；
 - pending/running/succeeded/failed；
-- approved/corrected/rejected/skipped；
+- resolved/partial/unresolved/conflict/invalid；
+- auto-approved/approved/corrected/confirmed-unresolved/rejected/skipped；
 - 当前运行时长和最近心跳；
 - OMLX 和来源异常提示。
+
+当前实现展示总数、成功、失败、已核对、运行版本、控制版本和进度条。`pending/running` 已在后端实时统计；P0-3 必须把上述四类状态和独立分母直接补到卡片，不再通过总数和“成功”推断业务覆盖率。
 
 ### 11.2 数据集视图
 
@@ -571,13 +598,13 @@ sequenceDiagram
 │ 审核状态       │ 编辑控件               │ 来源定位/转换过程       │
 │               │                        │ attempt 历史          │
 ├───────────────┴────────────────────────┴─────────────────────┤
-│ 批准 / 修正后批准 / 驳回重采 / 跳过 / 保存并下一条            │
+│ 批准 / 修正后批准 / 确认未解决 / 驳回重采 / 跳过 / 下一条     │
 └──────────────────────────────────────────────────────────────┘
 ```
 
 ### 13.2 行队列
 
-默认排序：
+队列只接收已执行且需人工决策的项；`PENDING/LEASED/RUNNING/DISCARDED` 不得进入，`AUTO_APPROVED` 只进入抽样队列。默认排序：
 
 1. 失败；
 2. 来源冲突；
@@ -591,10 +618,13 @@ sequenceDiagram
 - 工作表；
 - dataset；
 - collection status；
+- resolution status；
 - review status；
 - field group；
 - confidence band；
 - error category；
+- review reason code；
+- risk level；
 - source domain；
 - business key；
 - 只看被分配给我。
@@ -632,6 +662,28 @@ sequenceDiagram
 
 不展示模型隐藏思维过程，只展示结构化输入摘要、输出、规则、校验和选择依据。
 
+#### 13.4.1 当前证据展示与待增强字段
+
+当前页面已显示来源标题/URL 和最多 1,500 字符摘录，后端 `metadata` 已保存以下信息，UI 应按下图分层补充：
+
+```mermaid
+flowchart TB
+    Evidence[来源证据卡] --> Identity[标题 / URL / 域名 / 搜索排名]
+    Evidence --> Acquisition[获取方式]
+    Acquisition --> HTTP[普通 HTTP]
+    Acquisition --> PW[Playwright 渲染\n显示回退原因]
+    Evidence --> Content[正文摘录 / 媒体类型 / 图片数]
+    Evidence --> Quality[是否被复核选中 / confidence / conflicts]
+    Evidence --> Failure[获取错误 / HTTP 状态 / 挑战页标识]
+```
+
+建议交互：
+
+- `browser_rendered=true` 显示“浏览器渲染”标签和 `browser_fallback_reason`；
+- 验证码/挑战页显示“访问受限，未作为正文证据”，不显示其挑战文本；
+- `selected=true` 的来源置顶，并展示复核 confidence/conflicts/reason；
+- 联系表图片作为受控证据预览，不对外暴露临时对象地址。
+
 ### 13.5 快捷键
 
 建议默认：
@@ -640,6 +692,7 @@ sequenceDiagram
 - `E`：进入编辑；
 - `R`：驳回重采；
 - `S`：跳过；
+- `U`：确认未解决；
 - `J/K`：下一条/上一条；
 - `Ctrl/Cmd + Enter`：保存并下一条；
 - `Esc`：取消未保存修改。
@@ -654,7 +707,8 @@ GET  /api/v1/tasks/:taskId/review-items
 GET  /api/v1/review-items/:itemId/context
 POST /api/v1/review-items/:itemId/decisions
 POST /api/v1/review-items/:itemId/retry
-POST /api/v1/reviews/bulk
+POST /api/v1/reviews/bulk/preview
+POST /api/v1/reviews/bulk/apply
 ```
 
 单条决定：
@@ -684,6 +738,8 @@ POST /api/v1/reviews/bulk
 8. 标记相关正式导出为 `STALE`；
 9. 写入 task event 和 audit log。
 
+单条决定还支持 `CONFIRMED_UNRESOLVED`，要求非空原因码、调查摘要和已使用证据引用，不允许字段覆盖伪造业务值。`AUTO_APPROVED` 只由后端 ReviewPolicy 引擎产生，普通审核用户不能手工选择该决定。
+
 ### 14.1 批量审核
 
 请求必须使用服务端 filter snapshot，而不是发送成千上万个完整对象：
@@ -694,8 +750,10 @@ POST /api/v1/reviews/bulk
   "filter": {
     "datasetId": "ai_index",
     "confidenceBand": "HIGH",
+    "resolutionStatus": "RESOLVED",
     "reviewStatus": "UNREVIEWED",
-    "hasConflict": false
+    "hasConflict": false,
+    "maxRiskLevel": "LOW"
   },
   "excludedItemIds": [],
   "decision": "APPROVED",
@@ -705,11 +763,17 @@ POST /api/v1/reviews/bulk
 
 流程：
 
-1. 前端请求批量操作预览；
-2. 后端返回数量、样本、风险和短期 preview token；
+1. 前端请求批量操作预览，后端冻结筛选条件、目标 ID 与每项 expected version；
+2. 后端返回数量、样本、风险、排除数及原因，以及短期 preview token；
 3. 用户确认；
-4. 后端使用同一筛选快照执行；
-5. 如果数据版本改变则拒绝并要求重新预览。
+4. 后端使用同一筛选快照执行，返回逐项成功/冲突结果；
+5. 如果任一项版本改变，该项不得应用，前端明确展示并要求重新预览。
+
+批量批准只允许 `execution_status=SUCCEEDED`、`resolution_status=RESOLVED`、无冲突、校验有效且风险不超过策略上限的结果。`PARTIAL/UNRESOLVED/CONFLICT/INVALID`、未执行项和在途项必须被预览明确排除。批量 `CONFIRMED_UNRESOLVED` 首版禁用，避免将未做充分调查的项集体关闭。
+
+### 14.2 自动审核策略
+
+ReviewPolicy 是不可变版本，包含适用数据集/字段组、允许的解决状态、来源级别、确定性校验、风险阈值和抽样比例。发布新版本不回溯改写旧决定；每个 `AUTO_APPROVED` 项可反查策略版本、命中条件和抽样状态。抽样错误率超阈值时自动停用对应策略并生成待处理事件。
 
 ## 15. 导出应用设计
 
@@ -724,10 +788,13 @@ GET /api/v1/tasks/:taskId/export-readiness
 - ready；
 - task execution/review status；
 - 未审核必需结果组；
+- 未达到审核门禁的必需结果组；
 - rejected；
 - skipped；
 - collection failed；
 - conflict；
+- invalid；
+- confirmed unresolved 数量及未解决报告链接；
 - stale review；
 - 可跳转的筛选链接。
 
@@ -802,29 +869,32 @@ worker 只读取 snapshot，不读取可能继续变化的“当前值”。
 - 数据库 migration 版本；
 - worker 数和最近心跳；
 - 队列深度；
-- OMLX 可用性、延迟和模型 alias；
-- OMLX 文本/视觉分类队列、当前并发和能力探测状态；
-- 最近一次工作簿/图片识别金标回归结果；
+- OMLX 可用性、延迟和固定模型 `Qwen3.8-27B-6bit`；
+- OMLX 全局串行队列、队列深度、当前在途请求（必须 `<= 1`）和能力探测状态；
+- 最近一次由 CI/外部验收系统发布的识别质量摘要（不含金标内容、路径或样本）；
 - 对象存储；
 - 最近连续错误；
 - 卡住任务。
 
+当前管理页已显示用户、OMLX `/models` 健康结果和审计日志；worker 心跳、队列深度、SearXNG 引擎响应、Playwright 回退率和挑战页率尚未进入管理 UI，上述条目是目标状态看板。
+
 ### 17.2 模型配置
 
-只显示：
+该页面只读展示：
 
-- alias；
 - endpoint 主机；
-- model name；
+- 固定 model name `Qwen3.8-27B-6bit`；
 - 实际模型修订和量化；
 - capabilities：`vision`、`structured_output`、MIME 和输入上限；
 - 是否配置 key；
 - timeout；
-- max concurrency；
+- max concurrency：固定 1，不提供修改控件；
 - 健康状态；
 - 最近能力探测时间与结果。
 
 永不通过 GET API 返回 key。
+
+管理页不提供模型选择、备用模型、并发调节或多行批处理开关。实际模型 ID 不匹配时显示阻断错误，不自动降级。
 
 ### 17.3 来源配置
 
@@ -835,6 +905,8 @@ worker 只读取 snapshot，不读取可能继续变化的“当前值”。
 - 凭据是否配置；
 - 保留策略；
 - 最近成功率。
+
+当前来源配置由 `.env` 和 NAS SearXNG `settings.yml` 管理，Web 页面尚未提供修改功能。为避免误操作，后续 UI 第一阶段建议只读展示 endpoint 主机、搜索间隔、抓取/浏览器超时、是否启用 Playwright 和最近健康结果；密钥永不通过 GET API 返回。
 
 ## 18. 权限矩阵
 
@@ -968,8 +1040,11 @@ SystemHealthPanel
 - export snapshot isolation；
 - SSE replay。
 - 视觉模型能力探测和 OpenAI 兼容图像请求合约；
-- OOXML 结构图、工作表渲染和识别融合金标；
+- OOXML 结构图、工作表渲染和识别融合的外部测试集；
 - 模型识别越界、幻觉坐标和冲突强制转人工。
+- HTML/PDF/DOCX 提取和图像联系表；
+- Playwright 回退选择、JavaScript 正文恢复、验证码页排除与原 URL 保留；
+- 单元进入 RUNNING 和完成时的任务统计立即一致性。
 
 ### 24.2 前端
 
@@ -1010,7 +1085,24 @@ SystemHealthPanel
 - permission dependency；
 - OpenAPI 生成和前端 Client。
 
-### 25.2 文件和任务最小闭环
+### 25.2 P0-3：状态语义
+
+- 任务列表/详情同时显示 execution、resolution、review 和 export；
+- API 返回三套独立计数及分母；
+- 审核队列和 readiness 基于 resolution/review 口径，不基于 `SUCCEEDED`。
+
+### 25.3 P0-2：吞吐与可恢复性可视化
+
+- 显示每行“直链获取/搜索降级”路由、来源获取/解析、第一次 Qwen 综合、第二次 Qwen 复核、校验阶段进度，以及 URL/内容缓存命中、搜索降级原因、模型排队、重试等待时间、预估剩余时间和可操作的失败原因；
+- 技术详情可展示快照/尝试引用，不向普通用户暴露队列实现。
+
+### 25.4 P0-4：异常审核
+
+- 异常优先队列、ReviewPolicy 和抽样队列；
+- `CONFIRMED_UNRESOLVED` 单条决策及理由/证据必填；
+- 批量 preview/apply 两步交互、风险排除和逐项冲突结果。
+
+### 25.5 文件和任务最小闭环
 
 - 上传；
 - 分析状态；
@@ -1019,14 +1111,14 @@ SystemHealthPanel
 - start/pause/resume/stop；
 - SSE。
 
-### 25.3 采集结果查询
+### 25.6 采集结果查询
 
 - 数据集进度；
 - review queue；
 - review context；
 - evidence viewer。
 
-### 25.4 审核和导出
+### 25.7 审核和导出
 
 - 单条审核；
 - 版本冲突；
@@ -1034,24 +1126,27 @@ SystemHealthPanel
 - readiness；
 - export job 和下载。
 
-### 25.5 管理与优化
+### 25.8 管理与优化
 
 - 模板管理；
 - 系统状态；
 - 用户和角色；
 - 质量效率看板。
 
-## 26. 应用设计完成条件
+## 26. 应用下一阶段完成条件
 
-进入 UI 和 API 全面开发前，至少确认：
+UI 和 API 的第一版已实现。进入生产化前，至少确认：
 
 1. 页面路由和角色权限；
-2. 任务、审核和导出三套状态及 allowedActions；
+2. 任务执行、业务解决、审核和导出四套状态及 allowedActions；
 3. 新建任务向导字段；
 4. ReviewContext DTO；
 5. 单条和批量审核语义；
-6. `SKIPPED` 是否允许排除后导出；
+6. `SKIPPED` 仅允许已配置的可选项排除后导出，`CONFIRMED_UNRESOLVED` 允许保持空值并必须生成未解决报告；
 7. OpenAPI 第一版；
 8. 设计原型能够让用户在不离开核对页面的情况下判断常规数据；
 9. 275 行端到端测试脚本；
 10. 正式导出和内部预览的权限及视觉区分。
+11. 证据卡显示 Playwright 回退、挑战页排除、选中来源和复核理由；
+12. 任务详情显示 pending/running，并用 SSE 或保留轮询降级实现稳定实时更新。
+13. P0-3 → P0-2 → P0-4 顺序的 API/UI 验收完成，无未执行或冲突项进入批量通过。

@@ -6,6 +6,8 @@ import { api, post } from "../../api";
 import type { FileItem, Sheet } from "../../types";
 import StatusTag from "../../components/StatusTag.vue";
 import { ElMessage } from "element-plus";
+
+// 文件详情展示识别后的工作表契约；active 只控制预览，不修改服务端分析结果。
 const route = useRoute<"/files/[fileId]">();
 const id = String(route.params.fileId);
 const active = ref("");
@@ -19,6 +21,7 @@ const selected = computed(
     query.data.value?.sheets?.[0],
 );
 async function recognize() {
+  // 重新识别是显式人工操作，避免页面访问时重复占用唯一的本地模型通道。
   await post(`/api/v1/files/${id}/recognize`);
   ElMessage.success("已提交多模态识别");
 }
@@ -28,6 +31,7 @@ function selectSheet(value: string | number) {
 </script>
 <template>
   <div v-if="query.data.value">
+    <!-- 左侧切换工作表，右侧同时展示渲染预览和模型识别出的字段角色。 -->
     <div class="page-head">
       <div>
         <h1>{{ query.data.value.originalName }}</h1>

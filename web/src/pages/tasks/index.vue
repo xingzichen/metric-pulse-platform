@@ -4,6 +4,10 @@ import { useQuery } from "@tanstack/vue-query";
 import { api } from "../../api";
 import type { Task } from "../../types";
 import StatusTag from "../../components/StatusTag.vue";
+import { getStatusPresentation } from "../../status-display";
+import { pendingReviewCount } from "../../task-stats";
+
+// 状态筛选直接传给服务端；查询键包含筛选值，避免不同列表误用同一缓存。
 const status = ref("");
 const query = useQuery({
   queryKey: ["tasks", status],
@@ -15,6 +19,7 @@ const query = useQuery({
 });
 </script>
 <template>
+  <!-- 列表只展示决策所需的概要信息，点击整行进入任务控制和状态分布。 -->
   <div class="page-head">
     <div>
       <h1>采集任务</h1>
@@ -41,6 +46,7 @@ const query = useQuery({
             'STOPPED',
           ]"
           :key="x"
+          :label="getStatusPresentation(x).label"
           :value="x"
       /></el-select>
     </div>
@@ -60,7 +66,7 @@ const query = useQuery({
         ></el-table-column
       ><el-table-column label="待核对"
         ><template #default="s">{{
-          (s.row.stats.succeeded || 0) - (s.row.stats.reviewed || 0)
+          pendingReviewCount(s.row.stats)
         }}</template></el-table-column
       ><el-table-column
         prop="updatedAt"

@@ -1,3 +1,9 @@
+"""从已识别工作簿创建和发布采集模板。
+
+模板保存字段角色和工作表结构供相似文件复用；发布动作冻结版本，避免运行任务因模板继续
+编辑而改变已经生成的行契约。
+"""
+
 from __future__ import annotations
 
 import hashlib
@@ -17,6 +23,8 @@ def create_template_from_file(
     name: str,
     actor: User,
 ) -> TemplateVersion:
+    """复制当前文件分析为独立模板版本，并记录创建审计。"""
+
     if not file.analysis:
         raise ValueError("File has no analysis")
     latest = db.scalar(select(func.max(TemplateVersion.version)).where(TemplateVersion.name == name))
@@ -63,6 +71,8 @@ def create_template_from_file(
 
 
 def publish_template(db: Session, template: TemplateVersion, actor: User) -> None:
+    """发布模板并记录审计；调用路由负责限制可发布状态。"""
+
     template.status = "PUBLISHED"
     audit(
         db,
