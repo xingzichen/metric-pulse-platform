@@ -1,5 +1,7 @@
-FROM node:25-alpine AS build
-RUN corepack enable
+FROM node:24-alpine AS build
+# Node.js 25 起不再随镜像分发 Corepack；显式固定 pnpm，保证本地与 CI 构建一致。
+ARG PNPM_VERSION=10.32.1
+RUN npm install --global pnpm@${PNPM_VERSION}
 WORKDIR /app
 COPY package.json pnpm-lock.yaml ./
 RUN pnpm install --frozen-lockfile

@@ -1,8 +1,8 @@
 name: metric-pulse
 
 # 生产编排只拉取已经发布的镜像，不在服务器上重复构建源代码。
-# MP_IMAGE_TAG 默认固定为正式版本 1.0.0；升级或回滚时可临时指定其他不可变版本。
-x-app-image: &app-image ghcr.io/xingzichen/metric-pulse-platform-api:${MP_IMAGE_TAG:-1.0.0}
+# MP_IMAGE_TAG 默认固定为正式版本 1.0.1；升级或回滚时可临时指定其他不可变版本。
+x-app-image: &app-image ghcr.io/xingzichen/metric-pulse-platform-api:${MP_IMAGE_TAG:-1.0.1}
 
 services:
   postgres:
@@ -94,7 +94,7 @@ services:
       redis: { condition: service_healthy }
 
   web:
-    image: ghcr.io/xingzichen/metric-pulse-platform-web:${MP_IMAGE_TAG:-1.0.0}
+    image: ghcr.io/xingzichen/metric-pulse-platform-web:${MP_IMAGE_TAG:-1.0.1}
     restart: unless-stopped
     ports:
       - "${MP_WEB_PORT:-8080}:80"
