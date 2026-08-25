@@ -8,7 +8,8 @@ services:
       POSTGRES_USER: metric_pulse
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      # PostgreSQL 18 起 PGDATA 位于版本目录，官方持久化挂载点改为此上级目录。
+      - postgres-data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U metric_pulse -d metric_pulse"]
       interval: 10s
