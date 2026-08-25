@@ -56,6 +56,36 @@ docker compose up --build -d
 
 默认 Web 端口为 `8080`。Compose 默认连接 `http://10.0.0.203:5008/v1` 的 OMLX 服务，可通过环境变量覆盖。当前 NAS 上已部署 SearXNG 供本地应用使用，但 API/worker/web Compose 仍只完成配置校验，未切换生产流量。
 
+## Docker 镜像发布与生产部署
+
+推送到 `main` 或推送 `v*` 版本标签时，GitHub Actions 会自动编译并发布两个 GHCR 镜像：
+
+- `ghcr.io/xingzichen/metric-pulse-platform-api`：供数据库迁移、API 和 worker 共用；
+- `ghcr.io/xingzichen/metric-pulse-platform-web`：Vue 静态文件和 Nginx 运行时。
+
+当前正式版本为 `1.0.0`。生产编排默认固定该版本，不依赖可变的 `latest` 标签：
+
+```bash
+cp .env.example .env
+# 设置 POSTGRES_PASSWORD、MP_BOOTSTRAP_PASSWORD、MP_OMLX_API_KEY 等生产参数
+docker compose -f compose.prod.yaml pull
+docker compose -f compose.prod.yaml up -d --remove-orphans
+```
+
+如果 GHCR 镜像保持私有，部署机器需先使用具有 `read:packages` 权限的 GitHub Token 登录：
+
+```bash
+echo "$GHCR_TOKEN" | docker login ghcr.io --username xingzichen --password-stdin
+```
+
+升级或回滚时可以显式指定已经发布的不可变版本，例如：
+
+```bash
+MP_IMAGE_TAG=1.0.0 docker compose -f compose.prod.yaml up -d --remove-orphans
+```
+
+工作流也可以在 GitHub Actions 页面手动触发。仓库需要允许 Actions 写入 Packages；生产密钥只保存在部署环境的 `.env` 中，不得提交。
+
 ## 质量验证
 
 ```bash
