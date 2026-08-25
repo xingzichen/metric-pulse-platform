@@ -2,11 +2,9 @@ name: 编译并发布 Docker 镜像
 
 on:
   push:
-    branches:
-      - main
+    # 镜像属于正式版本产物。普通代码或文档提交不构建镜像，只有发布 v* 标签时自动发布。
     tags:
       - "v*"
-  workflow_dispatch:
 
 # 发布 GHCR 镜像需要 packages:write；构建证明还需要 OIDC 与 attestations 权限。
 permissions:

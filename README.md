@@ -6,7 +6,7 @@
 
 ## 当前状态
 
-第一版端到端系统已经实现，可在本地开发环境或 Docker Compose 中运行。当前 API/Web 和采集任务在本地 Mac 运行，来源发现使用 NAS Docker 中的 SearXNG；应用本身尚未切换到 NAS 生产部署。
+第一版端到端系统已经实现，可在本地开发环境或 Docker Compose 中运行。正式版 API、Worker、Web、PostgreSQL 和 Redis 已通过 Docker Compose 部署到 x86_64 NAS；来源发现使用 NAS 中的 SearXNG，采集模型使用局域网 OMLX。
 
 已实现的业务闭环：
 
@@ -58,7 +58,7 @@ docker compose up --build -d
 
 ## Docker 镜像发布与生产部署
 
-推送到 `main` 或推送 `v*` 版本标签时，GitHub Actions 会自动编译并发布两个 GHCR 镜像：
+只有推送 `v*` 正式版本标签时，GitHub Actions 才会自动编译并发布两个 GHCR 镜像。普通 `main` 提交和文档更新不会构建镜像，也不提供绕过版本标签的手动构建入口：
 
 - `ghcr.io/xingzichen/metric-pulse-platform-api`：供数据库迁移、API 和 worker 共用；
 - `ghcr.io/xingzichen/metric-pulse-platform-web`：Vue 静态文件和 Nginx 运行时。
@@ -84,7 +84,7 @@ echo "$GHCR_TOKEN" | docker login ghcr.io --username xingzichen --password-stdin
 MP_IMAGE_TAG=1.0.2 docker compose -f compose.prod.yaml up -d --remove-orphans
 ```
 
-工作流也可以在 GitHub Actions 页面手动触发。仓库需要允许 Actions 写入 Packages；生产密钥只保存在部署环境的 `.env` 中，不得提交。
+完整的服务器/NAS 准备、环境变量、首次启动、验收、备份、升级、回滚和故障处理步骤见 [生产部署与运维手册](docs/deployment.md)。仓库需要允许 Actions 写入 Packages；生产密钥只保存在部署环境的 `.env` 中，不得提交。
 
 ## 质量验证
 
@@ -132,6 +132,7 @@ OMLX 视觉集成测试默认跳过；显式提供临时环境变量后运行 `t
 
 - [系统设计](docs/system-design.md)
 - [应用设计](docs/application-design.md)
+- [生产部署与运维手册](docs/deployment.md)
 - [ADR-0001：总体技术与架构决策](docs/adr/0001-technology-and-architecture.md)
 - [ADR-0002：Vue 前端、组件库与自动文件路由](docs/adr/0002-vue-frontend-and-file-routing.md)
 - [ADR-0003：本地多模态模型识别架构](docs/adr/0003-local-multimodal-recognition.md)
