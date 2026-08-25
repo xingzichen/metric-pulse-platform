@@ -10,13 +10,16 @@ from metric_pulse.collector import (
     CollectionResult,
     EvidenceItem,
     OMLXCollector,
+    _normalize_image_table_response,
     apply_ai_index_conversion,
     apply_source_provenance,
     apply_verification,
     build_search_query,
+    enrich_document_image_tables,
     extract_structured_values,
     focus_evidence,
     render_search_evidence,
+    render_source_documents,
     structured_match_diagnostics,
     validate_public_url,
 )
@@ -28,8 +31,9 @@ from metric_pulse.dataset_profiles import (
     ai_algorithm_collection_row_contract,
 )
 from metric_pulse.models import CollectionUnit, DataRecord
+from metric_pulse.omlx import OMLXClient, OMLXError
 from metric_pulse.processor import validate_production_collection_contract
-from metric_pulse.source_pipeline import SourceDocument
+from metric_pulse.source_pipeline import ImageEvidence, SourceDocument
 
 
 def _address(ip: str, port: int = 443):
@@ -161,6 +165,22 @@ def test_github_innovation_graph_ec_2021q3_is_uniquely_matched() -> None:
         {"be_data": 125033},
         "developers,iso2_code,year,quarter\n125033,EC,2021,3",
     )
+
+
+def test_ai_index_empty_workbook_rows_6892_to_6894_match_world_bank_series() -> None:
+    source = (
+        "country,country_id,date,value,decimal\n"
+        "美国,US,2018,2.98956,2\n美国,US,2019,3.14297,2\n美国,US,2020,3.41788,2\n"
+    )
+
+    for period, expected in ((2018, 2.98956), (2019, 3.14297), (2020, 3.41788)):
+        descriptors = {"region": "美国", "statistical_date": period}
+        assert structured_match_diagnostics(source, descriptors)["status"] == "UNIQUE_MATCH"
+        assert extract_structured_values(source, descriptors, ["be_data"]) == (
+            {"be_data": expected},
+            "country,country_id,date,value,decimal\n"
+            + next(line for line in source.splitlines() if f",{period}," in line),
+        )
 
 
 def test_focus_evidence_strips_html_and_keeps_matching_context() -> None:
@@ -570,9 +590,7 @@ def test_ambiguous_direct_source_falls_back_to_one_row_search(monkeypatch) -> No
         row_contract={"descriptors": {"region": "EC"}},
     )
 
-    result = asyncio.run(
-        OMLXCollector(FakeClient()).collect(record, CollectionUnit(target_fields=["data"]))
-    )
+    result = asyncio.run(OMLXCollector(FakeClient()).collect(record, CollectionUnit(target_fields=["data"])))
 
     assert searches == 1
     assert gathers == 2
@@ -607,9 +625,180 @@ def test_production_contract_accepts_direct_or_search_route_but_not_both() -> No
         validate_production_collection_contract(direct)
 
 
-def test_same_direct_source_fetches_once_but_keeps_two_model_calls_per_row(
-    monkeypatch, tmp_path
-) -> None:
+def test_image_tables_are_transcribed_into_full_source_text_and_audited(monkeypatch, tmp_path) -> None:
+    import metric_pulse.collector as collector_module
+    import metric_pulse.source_pipeline as pipeline
+
+    collector_module._IMAGE_TABLE_CACHE.clear()
+    pipeline._SOURCE_CACHE.clear()
+    monkeypatch.setattr(get_settings(), "source_cache_root", tmp_path)
+    responses = [
+        {
+            "has_data_table": False,
+            "description": "Decorative technology photo",
+            "columns": [],
+            "rows": [],
+            "confidence": 0.99,
+        },
+        {
+            "has_data_table": True,
+            "description": "2021 AI innovation scores",
+            "columns": ["排名", "国家", "得分"],
+            "rows": [
+                [10, "澳大利亚", 26.81],
+                [22, "爱尔兰", 16.68],
+                [24, "爱沙尼亚", 15.14],
+            ],
+            "confidence": 0.98,
+        },
+    ]
+    prompts: list[str] = []
+
+    class FakeClient:
+        def __init__(self) -> None:
+            self.last_response_metadata = {"usage": {"total_tokens": 123}}
+
+        async def generate_json(self, *, system, prompt, image_png=None):
+            assert image_png is not None
+            prompts.append(prompt)
+            return responses.pop(0)
+
+    document = SourceDocument(
+        index=1,
+        url="https://example.com/article",
+        normalized_url="https://example.com/article",
+        cache_key="https://example.com/article",
+        title="2021全球人工智能创新指数报告",
+        media_type="text/html",
+        text=(
+            "Article opening.\n[[METRIC_PULSE_IMAGE:1]]\n"
+            "Figure: 2021 scores.\n[[METRIC_PULSE_IMAGE:2]]\nArticle ending."
+        ),
+        images=[
+            ImageEvidence(
+                "Source 1, decorative",
+                b"decorative-image",
+                1,
+                description="decorative",
+                marker="[[METRIC_PULSE_IMAGE:1]]",
+            ),
+            ImageEvidence(
+                "Source 1, score chart",
+                b"score-chart",
+                1,
+                description="2021年各国人工智能创新指数得分与排名",
+                marker="[[METRIC_PULSE_IMAGE:2]]",
+            ),
+        ],
+    )
+
+    calls = asyncio.run(enrich_document_image_tables(document, FakeClient()))
+
+    assert [item["phase"] for item in calls] == ["VISION_TABLE", "VISION_TABLE"]
+    assert [item["status"] for item in calls] == ["SUCCEEDED", "SUCCEEDED"]
+    assert "Decorative technology photo" not in document.text
+    assert "| 排名 | 国家 | 得分 |" in document.text
+    assert "| 10 | 澳大利亚 | 26.81 |" in document.text
+    assert "| 22 | 爱尔兰 | 16.68 |" in document.text
+    assert "| 24 | 爱沙尼亚 | 15.14 |" in document.text
+    assert "Article opening." in document.text and "Article ending." in document.text
+    assert "METRIC_PULSE_IMAGE" not in document.text
+    rendered = render_source_documents([document], {"region": "爱尔兰"})
+    assert "Article opening." in rendered and "Article ending." in rendered
+    assert "| 22 | 爱尔兰 | 16.68 |" in rendered
+    assert document.image_table_results[1]["has_data_table"] is True
+    assert all("Source article title: 2021全球人工智能创新指数报告" in prompt for prompt in prompts)
+    assert "2021年各国人工智能创新指数得分与排名" in prompts[1]
+
+
+def test_image_table_normalization_salvages_irregular_long_table_rows() -> None:
+    result = _normalize_image_table_response(
+        {
+            "has_data_table": True,
+            "description": "国家排名",
+            "columns": ["排名", "国家", "得分"],
+            "guessed_columns": ["得分"],
+            "rows": [[1, "美国", 59.43], [2, "中国"], [3, "英国", 45.07, "备注"]],
+            "confidence": 0.96,
+        }
+    )
+
+    assert result["shape_adjusted"] is True
+    assert result["columns"] == ["排名", "国家", "得分[推测]", "未命名列1[推测]"]
+    assert result["guessed_columns"] == ["得分[推测]", "未命名列1[推测]"]
+    assert result["rows"] == [
+        [1, "美国", 59.43, None],
+        [2, "中国", None, None],
+        [3, "英国", 45.07, "备注"],
+    ]
+
+
+def test_image_table_truncation_retries_with_larger_output_budget(monkeypatch, tmp_path) -> None:
+    settings = get_settings()
+    monkeypatch.setattr(settings, "source_cache_root", tmp_path)
+    monkeypatch.setattr(settings, "vision_table_max_output_tokens", 8_192)
+    monkeypatch.setattr(settings, "vision_table_retry_max_output_tokens", 16_384)
+
+    class RetryClient(OMLXClient):
+        def __init__(self) -> None:
+            super().__init__(settings)
+            self.budgets: list[int | None] = []
+
+        async def generate_json(self, *, system, prompt, image_png=None, max_output_tokens=None):
+            self.budgets.append(max_output_tokens)
+            if len(self.budgets) == 1:
+                self.last_response_metadata = {"finish_reason": "length"}
+                raise OMLXError("Unterminated string in JSON response")
+            self.last_response_metadata = {"finish_reason": "stop"}
+            return {
+                "has_data_table": True,
+                "description": "ranking",
+                "columns": ["country", "score"],
+                "rows": [["Ireland", 16.68]],
+                "confidence": 1,
+            }
+
+    document = SourceDocument(
+        index=1,
+        url="https://example.com/long-table",
+        text="[[METRIC_PULSE_IMAGE:1]]",
+        images=[
+            ImageEvidence(
+                "long table",
+                b"unique-long-table-image",
+                1,
+                marker="[[METRIC_PULSE_IMAGE:1]]",
+            )
+        ],
+    )
+    client = RetryClient()
+
+    calls = asyncio.run(enrich_document_image_tables(document, client))
+
+    assert client.budgets == [8_192, 16_384]
+    assert [call["status"] for call in calls] == ["FAILED", "SUCCEEDED"]
+    assert calls[0]["output_summary"]["will_retry"] is True
+    assert "| Ireland | 16.68 |" in document.text
+
+
+def test_production_contract_allows_only_vision_calls_before_synthesize_and_verify() -> None:
+    result = CollectionResult(
+        values={"data": 1},
+        acquisition_attempt={"route": "DIRECT_LINK", "status": "SUCCEEDED"},
+        model_calls=[
+            {"phase": "VISION_TABLE", "model": "Qwen3.8-27B-6bit"},
+            {"phase": "SYNTHESIZE", "model": "Qwen3.8-27B-6bit"},
+            {"phase": "VERIFY", "model": "Qwen3.8-27B-6bit"},
+        ],
+    )
+
+    validate_production_collection_contract(result)
+    result.model_calls[0]["phase"] = "VERIFY"
+    with pytest.raises(ValueError, match="VISION_TABLE"):
+        validate_production_collection_contract(result)
+
+
+def test_same_direct_source_fetches_once_but_keeps_two_model_calls_per_row(monkeypatch, tmp_path) -> None:
     import metric_pulse.source_pipeline as pipeline
 
     pipeline._SOURCE_CACHE.clear()
@@ -672,15 +861,21 @@ def test_same_direct_source_fetches_once_but_keeps_two_model_calls_per_row(
                 }
             },
         )
-        result = asyncio.run(
-            collector.collect(record, CollectionUnit(target_fields=["data"]))
-        )
+        result = asyncio.run(collector.collect(record, CollectionUnit(target_fields=["data"])))
         assert result.acquisition_attempt["route"] == "DIRECT_LINK"
 
     assert fetches == 1
     assert len(prompts) == 4
     assert all("ROW_B" not in prompt for prompt in prompts[:2])
     assert all("ROW_A" not in prompt for prompt in prompts[2:])
+    shared_prefixes = [
+        prompt.split("<shared_sources>\n", 1)[1].split("\n</shared_sources>", 1)[0]
+        for prompt in prompts
+    ]
+    # SYNTHESIZE 与 VERIFY 的系统提示不同，只比较相同阶段在相邻行之间的可缓存前缀。
+    assert shared_prefixes[0] == shared_prefixes[2]
+    assert shared_prefixes[1] == shared_prefixes[3]
+    assert all(prompt.index("numbered_sources") < prompt.index("row_contract") for prompt in prompts)
 
 
 def test_github_monthly_rank_uses_fixed_source_and_isolates_one_repository(monkeypatch) -> None:
@@ -772,8 +967,9 @@ def test_github_monthly_rank_uses_fixed_source_and_isolates_one_repository(monke
     assert all("owner/repository-4" in prompt for prompt in prompts)
     assert all("owner/repository-3" not in prompt for prompt in prompts)
     assert all("owner/repository-5" not in prompt for prompt in prompts)
-    assert result.validation["deterministic_profile_values"]["exact_stargazers_count"] == (
-        repositories[3]["stargazers_count"]
+    assert (
+        result.validation["deterministic_profile_values"]["exact_stargazers_count"]
+        == (repositories[3]["stargazers_count"])
     )
 
 

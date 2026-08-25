@@ -250,6 +250,7 @@ class CollectionUnit(Base):
     record_id: Mapped[str] = mapped_column(ForeignKey("records.id", ondelete="CASCADE"), index=True)
     run_version: Mapped[int] = mapped_column(Integer)
     target_fields: Mapped[list] = mapped_column(JSON)
+    source_affinity_key: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(40), default=UnitStatus.PENDING, index=True)
     resolution_status: Mapped[str] = mapped_column(
         String(40), default=ResolutionStatus.NOT_EVALUATED, index=True
@@ -340,7 +341,7 @@ class SourceAcquisitionAttempt(Base):
 
 
 class ModelCall(Base):
-    """单次 SYNTHESIZE/VERIFY 模型调用的不可逆审计摘要。"""
+    """单次 VISION_TABLE/SYNTHESIZE/VERIFY 模型调用的不可逆审计摘要。"""
 
     __tablename__ = "model_calls"
 

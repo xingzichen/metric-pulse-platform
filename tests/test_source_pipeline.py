@@ -9,12 +9,15 @@ from PIL import Image
 
 from metric_pulse.source_pipeline import (
     ImageEvidence,
+    ImageReference,
     SourceDocument,
     browser_fallback_reason,
     build_contact_sheet,
+    compact_json_records,
     extract_docx,
     extract_html_main_content,
     extract_pdf,
+    fetch_source_document,
     gather_source_documents,
     looks_like_challenge_page,
     normalize_source_url,
@@ -38,7 +41,57 @@ def test_html_extraction_keeps_main_content_and_drops_boilerplate() -> None:
     assert "42 AI companies" in text
     assert "unrelated navigation" not in text
     assert "unrelated footer" not in text
-    assert images == [("https://example.com/chart.png", "AI companies chart")]
+    assert "[[METRIC_PULSE_IMAGE:1]]" in text
+    assert images == [
+        ImageReference(
+            url="https://example.com/chart.png",
+            description=("alt: AI companies chart | 邻近正文: Sweden created 42 AI companies in 2025."),
+            marker="[[METRIC_PULSE_IMAGE:1]]",
+        )
+    ]
+
+
+def test_world_bank_page_is_normalized_to_official_structured_api() -> None:
+    assert normalize_source_url("https://data.worldbank.org.cn/indicator/GB.XPD.RSDV.GD.ZS?locations=US") == (
+        "https://api.worldbank.org/v2/zh/country/US/indicator/GB.XPD.RSDV.GD.ZS?format=json&per_page=20000"
+    )
+
+
+def test_nested_json_record_array_is_compacted_to_matchable_csv() -> None:
+    text = compact_json_records(
+        b'[{"page":1},[{"country":{"id":"US","value":"United States"},'
+        b'"date":"2019","value":3.14297,"decimal":2}]]'
+    )
+
+    assert text is not None
+    assert text.splitlines()[0] == "country,country_id,date,value,decimal"
+    assert "United States,US,2019,3.14297,2" in text
+
+
+def test_github_api_keeps_raw_json_for_dedicated_ranking_parser(monkeypatch) -> None:
+    import asyncio
+
+    import metric_pulse.source_pipeline as pipeline
+
+    payload = b'{"total_count":1,"incomplete_results":false,"items":[{"full_name":"a/b"}]}'
+
+    async def fake_download(_client, url, _validate_url, **_kwargs):
+        return url, "application/json", payload
+
+    async def allow(_url):
+        return None
+
+    monkeypatch.setattr(pipeline, "_download", fake_download)
+    candidate = SimpleNamespace(
+        source_url="https://api.github.com/search/repositories?q=stars",
+        title="Ranking",
+        excerpt=None,
+    )
+
+    document = asyncio.run(fetch_source_document(candidate, 1, object(), allow))
+
+    assert document.text.startswith('{"total_count":1')
+    assert '"items"' in document.text
 
 
 def test_pdf_extraction_includes_text_and_rendered_page() -> None:
@@ -181,6 +234,118 @@ def test_source_document_cache_survives_memory_cache_clear(monkeypatch, tmp_path
     assert second[0].text == first[0].text
 
 
+def test_persistent_source_cache_restores_image_bytes_without_refetch(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    import metric_pulse.source_pipeline as pipeline
+
+    pipeline._SOURCE_CACHE.clear()
+    pipeline._SOURCE_CACHE_LOCKS.clear()
+    settings = pipeline.get_settings()
+    monkeypatch.setattr(settings, "source_cache_root", tmp_path)
+    monkeypatch.setattr(settings, "source_host_min_interval_seconds", 0)
+    fetches = 0
+    image = Image.new("RGB", (24, 24), "white")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    png = buffer.getvalue()
+
+    async def fake_fetch(candidate, index, client, validate_url):
+        nonlocal fetches
+        fetches += 1
+        return SourceDocument(
+            index=index,
+            url=candidate.source_url,
+            media_type="text/html",
+            text="Article body [[METRIC_PULSE_IMAGE:1]]",
+            images=[
+                ImageEvidence(
+                    "Source 1 chart",
+                    png,
+                    index,
+                    description="Figure 1: score table",
+                    marker="[[METRIC_PULSE_IMAGE:1]]",
+                )
+            ],
+        )
+
+    async def allow(_url):
+        return None
+
+    monkeypatch.setattr(pipeline, "fetch_source_document", fake_fetch)
+    candidate = SimpleNamespace(
+        source_url="https://example.com/image-article",
+        title="Image article",
+        excerpt=None,
+    )
+
+    first = asyncio.run(gather_source_documents([candidate], allow, browser_fallback_enabled=False))
+    pipeline._SOURCE_CACHE.clear()
+    second = asyncio.run(gather_source_documents([candidate], allow, browser_fallback_enabled=False))
+
+    assert fetches == 1
+    assert first[0].images[0].png == png
+    assert second[0].persistent_cache_hit is True
+    assert second[0].images[0].png == png
+    assert second[0].images[0].description == "Figure 1: score table"
+
+
+def test_challenge_negative_cache_blocks_repeated_url_and_same_host(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    import metric_pulse.source_pipeline as pipeline
+
+    pipeline._SOURCE_CACHE.clear()
+    pipeline._SOURCE_CACHE_LOCKS.clear()
+    settings = pipeline.get_settings()
+    monkeypatch.setattr(settings, "source_cache_root", tmp_path)
+    monkeypatch.setattr(settings, "source_host_min_interval_seconds", 0)
+    monkeypatch.setattr(settings, "source_challenge_cooldown_seconds", 600)
+    monkeypatch.setattr(settings, "source_cooldown_max_seconds", 600)
+    fetches = 0
+
+    async def fake_fetch(candidate, index, client, validate_url):
+        nonlocal fetches
+        fetches += 1
+        return SourceDocument(
+            index=index,
+            url=candidate.source_url,
+            http_status=403,
+            error="HTTP 403: security challenge captcha",
+        )
+
+    async def allow(_url):
+        return None
+
+    monkeypatch.setattr(pipeline, "fetch_source_document", fake_fetch)
+
+    def candidate(path: str):
+        return SimpleNamespace(
+            source_url=f"https://blocked.example.com/{path}",
+            title="Blocked article",
+            excerpt=None,
+        )
+
+    first = asyncio.run(
+        gather_source_documents([candidate("one")], allow, browser_fallback_enabled=False)
+    )
+    repeated = asyncio.run(
+        gather_source_documents([candidate("one")], allow, browser_fallback_enabled=False)
+    )
+    same_host = asyncio.run(
+        gather_source_documents([candidate("two")], allow, browser_fallback_enabled=False)
+    )
+
+    assert fetches == 1
+    assert first[0].source_failure_category == "CHALLENGE"
+    assert repeated[0].error == "source cooldown active: CHALLENGE"
+    assert same_host[0].error == "source cooldown active: CHALLENGE"
+    assert repeated[0].retry_after_seconds > 0
+    normalized = pipeline.normalize_source_url(candidate("one").source_url)
+    pipeline._clear_source_failure(normalized, normalized)
+    assert pipeline._active_source_cooldown(normalized, normalized) is None
+
+
 def test_dynamic_snapshot_cache_is_reused_within_scope_but_refetched_for_new_scope(
     monkeypatch,
     tmp_path,
@@ -228,7 +393,6 @@ def test_dynamic_snapshot_cache_is_reused_within_scope_but_refetched_for_new_sco
     assert first[0].text == same_snapshot[0].text
     assert new_snapshot[0].text != first[0].text
     assert all(
-        document.normalized_url
-        == "https://api.github.com/search/repositories?q=stars"
+        document.normalized_url == "https://api.github.com/search/repositories?q=stars"
         for document in (first[0], same_snapshot[0], new_snapshot[0])
     )

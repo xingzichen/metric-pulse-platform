@@ -18,7 +18,12 @@ def test_generate_json_uses_qwen_compatible_parameters(monkeypatch) -> None:
         def json(self) -> dict:
             return {
                 "id": "response-1",
-                "choices": [{"message": {"content": '{"values":{"answer":null}}'}}],
+                "choices": [
+                    {
+                        "message": {"content": '{"values":{"answer":null}}'},
+                        "finish_reason": "stop",
+                    }
+                ],
                 "usage": {
                     "prompt_tokens": 100,
                     "prompt_tokens_details": {"cached_tokens": 80},
@@ -57,6 +62,7 @@ def test_generate_json_uses_qwen_compatible_parameters(monkeypatch) -> None:
     assert result == {"values": {"answer": None}}
     assert captured["headers"]["Authorization"] == "Bearer test-key"
     assert captured["payload"]["stream"] is False
+    assert captured["payload"]["max_tokens"] == 4096
     assert captured["payload"]["chat_template_kwargs"] == {"enable_thinking": False}
     assert "response_format" not in captured["payload"]
     assert client.last_response_metadata == {
@@ -67,6 +73,7 @@ def test_generate_json_uses_qwen_compatible_parameters(monkeypatch) -> None:
         "cached_prompt_tokens": 80,
         "cache_hit": True,
         "response_id": "response-1",
+        "finish_reason": "stop",
     }
 
 

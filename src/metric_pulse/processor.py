@@ -14,15 +14,16 @@ import socket
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit, urlunsplit
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .collector import Collector, OMLXCollector, configured_collector
+from .collector import Collector, OMLXCollector, SourceCooldownError, configured_collector
 from .config import get_settings
 from .models import (
     CollectionAttempt,
     CollectionTask,
     CollectionUnit,
+    DataRecord,
     Evidence,
     ModelCall,
     ReviewStatus,
@@ -55,9 +56,7 @@ def persist_collection_audit(db: Session, unit: CollectionUnit, result) -> None:
 
     search_attempt: RowSearchAttempt | None = None
     linked_snapshot_ids = set(
-        db.scalars(
-            select(UnitSourceLink.snapshot_id).where(UnitSourceLink.unit_id == unit.id)
-        ).all()
+        db.scalars(select(UnitSourceLink.snapshot_id).where(UnitSourceLink.unit_id == unit.id)).all()
     )
     if result.search_attempt:
         item = result.search_attempt
@@ -165,7 +164,8 @@ def persist_collection_audit(db: Session, unit: CollectionUnit, result) -> None:
 def validate_production_collection_contract(result) -> None:
     """在落库前强制验证生产采集不变量。
 
-    该门禁防止未来重构意外绕过直链优先、固定双模型或指定本地模型。测试替身不受此约束，
+    该门禁防止未来重构意外绕过直链优先、来源级图片表格预处理、固定双模型提取
+    或指定本地模型。测试替身不受此约束，
     因为它们用于状态机测试而非生产采集。
     """
 
@@ -182,8 +182,11 @@ def validate_production_collection_contract(result) -> None:
     ):
         raise ValueError("Search fallback requires one successful row search attempt")
     phases = [item.get("phase") for item in result.model_calls]
-    if phases != ["SYNTHESIZE", "VERIFY"]:
-        raise ValueError("Production collection requires exactly SYNTHESIZE then VERIFY")
+    if phases[-2:] != ["SYNTHESIZE", "VERIFY"] or any(phase != "VISION_TABLE" for phase in phases[:-2]):
+        raise ValueError(
+            "Production collection requires optional source-level VISION_TABLE calls followed by "
+            "exactly SYNTHESIZE then VERIFY"
+        )
     if any(item.get("model") != "Qwen3.8-27B-6bit" for item in result.model_calls):
         raise ValueError("Production collection used an unexpected model")
 
@@ -269,7 +272,12 @@ class TaskProcessor:
                         | (CollectionUnit.next_attempt_at <= datetime.now(UTC))
                     ),
                 )
-                .order_by(CollectionUnit.id)
+                .join(DataRecord, DataRecord.id == CollectionUnit.record_id)
+                .order_by(
+                    func.coalesce(CollectionUnit.source_affinity_key, CollectionUnit.id),
+                    DataRecord.source_row,
+                    CollectionUnit.id,
+                )
                 .limit(1)
                 .with_for_update(skip_locked=True)
             )
@@ -362,6 +370,8 @@ class TaskProcessor:
                 apply_resolution(unit)
                 if unit.status == UnitStatus.FAILED_RETRYABLE:
                     delay = settings.retry_base_seconds * (2 ** max(0, unit.attempt_count - 1))
+                    if isinstance(exc, SourceCooldownError):
+                        delay = max(delay, exc.retry_after_seconds)
                     unit.next_attempt_at = datetime.now(UTC) + timedelta(seconds=delay)
             # 无论成功或失败都释放租约并在同一事务刷新统计，前端不会长期显示幽灵运行单元。
             unit.lease_owner = None

@@ -34,7 +34,7 @@ def test_alembic_upgrade_head_succeeds_on_brand_new_database(tmp_path: Path) -> 
         assert "source_acquisition_attempts" in inspector.get_table_names()
         with engine.connect() as connection:
             assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-                "0006_direct_source_acquisition"
+                "0007_source_affinity_scheduling"
             )
     finally:
         engine.dispose()

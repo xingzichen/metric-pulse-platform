@@ -1,6 +1,6 @@
 # Metric Pulse Platform 生产部署与运维手册
 
-本文档说明如何使用已发布的 Docker 镜像，在 Linux 服务器或群晖 NAS 上部署、验证、升级、回滚和维护 Metric Pulse Platform。命令默认在项目部署目录执行，示例正式版本为 `1.0.2`。
+本文档说明如何使用已发布的 Docker 镜像，在 Linux 服务器或群晖 NAS 上部署、验证、升级、回滚和维护 Metric Pulse Platform。命令默认在项目部署目录执行，示例正式版本为 `1.0.3`。
 
 ## 1. 部署架构
 
@@ -81,7 +81,7 @@ cd /volume2/docker/metric-pulse-platform
 
 ```bash
 curl --fail --location --output compose.prod.yaml \
-  https://raw.githubusercontent.com/xingzichen/metric-pulse-platform/v1.0.2/compose.prod.yaml
+  https://raw.githubusercontent.com/xingzichen/metric-pulse-platform/v1.0.3/compose.prod.yaml
 ```
 
 也可以从仓库检出对应版本后复制 `compose.prod.yaml`。生产环境不需要源代码、Node.js 或 Python 开发环境。
@@ -92,7 +92,7 @@ curl --fail --location --output compose.prod.yaml \
 
 ```dotenv
 # 镜像版本与入口端口
-MP_IMAGE_TAG=1.0.2
+MP_IMAGE_TAG=1.0.3
 MP_WEB_PORT=56123
 
 # 数据库密码建议使用 openssl rand -hex 32 生成
@@ -107,7 +107,13 @@ MP_OMLX_BASE_URL=http://OMLX_HOST:5008/v1
 MP_OMLX_MODEL=Qwen3.8-27B-6bit
 MP_OMLX_API_KEY=替换为OMLX密钥
 MP_OMLX_TIMEOUT_SECONDS=900
-MP_OMLX_MAX_OUTPUT_TOKENS=2048
+MP_OMLX_MAX_OUTPUT_TOKENS=4096
+MP_SHEET_ANALYSIS_MAX_OUTPUT_TOKENS=2048
+MP_SYNTHESIZE_MAX_OUTPUT_TOKENS=4096
+MP_VERIFY_MAX_OUTPUT_TOKENS=4096
+MP_VISION_TABLE_ENRICHMENT_ENABLED=true
+MP_VISION_TABLE_MAX_OUTPUT_TOKENS=8192
+MP_VISION_TABLE_RETRY_MAX_OUTPUT_TOKENS=16384
 
 # 搜索服务
 MP_SEARCH_URL=http://SEARXNG_HOST:8888/search
@@ -117,6 +123,11 @@ MP_SEARCH_RETRY_DELAY_SECONDS=60
 
 # 来源获取与浏览器回退
 MP_SOURCE_FETCH_CONCURRENCY=3
+MP_SOURCE_CACHE_TTL_SECONDS=86400
+MP_SOURCE_TRANSIENT_COOLDOWN_BASE_SECONDS=60
+MP_SOURCE_CHALLENGE_COOLDOWN_SECONDS=3600
+MP_SOURCE_COOLDOWN_MAX_SECONDS=3600
+MP_SOURCE_HOST_MIN_INTERVAL_SECONDS=2
 MP_BROWSER_FALLBACK_ENABLED=true
 MP_BROWSER_TIMEOUT_SECONDS=180
 MP_BROWSER_SETTLE_SECONDS=5
@@ -142,7 +153,9 @@ docker compose --env-file .env -f compose.prod.yaml config --quiet
 注意事项：
 
 - `MP_OMLX_MODEL` 只能是 `Qwen3.8-27B-6bit`；
+- OMLX 的 128K 是输入与输出的总上下文上限，不要把所有阶段都直接调到 16K；视觉表格只有明确截断时才自动升档；
 - Worker 固定 `concurrency=1`，禁止增加 Celery 并发或启动多个 Worker 副本；
+- `source-cache-data` 卷必须同时挂载到 API、migrate 和 Worker，且纳入备份；删除该卷会失去正文/图片成功缓存和挑战页冷却状态，但不会删除数据库业务记录；
 - 单实例 OMLX 部署建议保持 `MP_VISION_ANALYSIS_ENABLED=false`；
 - 密码和 Key 不应出现在 Compose 文件、截图、工单或 Git 历史中；
 - 示例密码仅是占位符，不能直接用于生产。
@@ -375,7 +388,7 @@ docker compose --env-file .env -f compose.prod.yaml up -d --no-deps --force-recr
 
 ### 首页返回 500 或循环重定向
 
-确认使用 `1.0.2` 或更高正式版本的 Web 镜像，并检查实际镜像标签：
+确认使用 `1.0.3` 或更高正式版本的 Web 镜像，并检查实际镜像标签：
 
 ```bash
 docker compose --env-file .env -f compose.prod.yaml images
@@ -427,7 +440,7 @@ docker inspect metric-pulse-postgres-1
 
 | 项目 | 当前值 |
 | --- | --- |
-| 平台版本 | `1.0.2` |
+| 平台版本 | `1.0.3` |
 | NAS 架构 | `x86_64` |
 | 部署目录 | `/volume2/docker/metric-pulse-platform` |
 | Web 地址 | `http://10.0.0.7:56123` |

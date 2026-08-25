@@ -41,6 +41,7 @@ from .models import (
     UnitStatus,
     User,
 )
+from .source_pipeline import normalize_source_url
 from .state_machine import ensure_transition
 from .storage import FileObjectStore
 from .workbook import allocate_blank_rows, read_rows, top_list_ai_batch_state
@@ -92,6 +93,38 @@ def business_key(sheet: str, row: dict[str, Any], fields: list[str], source_row:
         identity = [source_row]
     payload = json.dumps([sheet, identity], ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def source_affinity_key(raw_data: dict[str, Any], record_business_key: str) -> str:
+    """相同规范 URL 使用同一调度亲和键；无直链行保持彼此隔离。"""
+
+    source_url = next(
+        (
+            value.strip()
+            for key, value in raw_data.items()
+            if key in {"source_url", "url", "link"} and isinstance(value, str) and value.strip()
+        ),
+        None,
+    )
+    identity = normalize_source_url(source_url) if source_url else f"unit:{record_business_key}"
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def planned_unit(
+    *,
+    task: CollectionTask,
+    record: DataRecord,
+    target_fields: list[str],
+) -> CollectionUnit:
+    """创建带来源亲和键的采集单元，不改变行级契约与业务键。"""
+
+    return CollectionUnit(
+        task_id=task.id,
+        record_id=record.id,
+        run_version=task.run_version,
+        target_fields=target_fields,
+        source_affinity_key=source_affinity_key(record.raw_data, record.business_key),
+    )
 
 
 def plan_task(db: Session, task: CollectionTask) -> dict[str, int]:
@@ -168,14 +201,7 @@ def plan_task(db: Session, task: CollectionTask) -> dict[str, int]:
                 )
                 db.add(record)
                 db.flush()
-                db.add(
-                    CollectionUnit(
-                        task_id=task.id,
-                        record_id=record.id,
-                        run_version=task.run_version,
-                        target_fields=profile_targets,
-                    )
-                )
+                db.add(planned_unit(task=task, record=record, target_fields=profile_targets))
                 records_created += 1
                 units_created += 1
             continue
@@ -225,14 +251,7 @@ def plan_task(db: Session, task: CollectionTask) -> dict[str, int]:
                 )
                 db.add(record)
                 db.flush()
-                db.add(
-                    CollectionUnit(
-                        task_id=task.id,
-                        record_id=record.id,
-                        run_version=task.run_version,
-                        target_fields=profile_targets,
-                    )
-                )
+                db.add(planned_unit(task=task, record=record, target_fields=profile_targets))
                 records_created += 1
                 units_created += 1
             continue
@@ -278,14 +297,7 @@ def plan_task(db: Session, task: CollectionTask) -> dict[str, int]:
             )
             db.add(record)
             db.flush()
-            db.add(
-                CollectionUnit(
-                    task_id=task.id,
-                    record_id=record.id,
-                    run_version=task.run_version,
-                    target_fields=missing,
-                )
-            )
+            db.add(planned_unit(task=task, record=record, target_fields=missing))
             records_created += 1
             units_created += 1
     task.stats = {

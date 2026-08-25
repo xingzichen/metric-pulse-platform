@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import csv
+import fcntl
 import hashlib
 import io
 import json
@@ -39,7 +41,7 @@ from .forbes_ai50 import ForbesAI50Error, compact_forbes_ai50_html
 MAX_DOCUMENT_BYTES = 20_000_000
 MAX_DOCUMENT_CHARS = 80_000
 MAX_PDF_PAGES = 50
-MAX_IMAGES_PER_SOURCE = 2
+MAX_IMAGES_PER_SOURCE = 6
 MAX_VISION_IMAGES = 6
 BOILERPLATE_TAGS = {
     "script",
@@ -88,7 +90,8 @@ BROWSER_EXCLUDED_SUFFIXES = {
 _SOURCE_CACHE: dict[str, SourceDocument] = {}
 _SOURCE_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 _SOURCE_CACHE_MAX_ITEMS = 2_048
-_PARSER_VERSION = "source-pipeline-v2"
+_PARSER_VERSION = "source-pipeline-v5-shared-cache-images-and-cooldowns"
+IMAGE_MARKER_PATTERN = re.compile(r"\[\[METRIC_PULSE_IMAGE:\d+\]\]")
 _TRACKING_QUERY_KEYS = {
     "fbclid",
     "gclid",
@@ -100,12 +103,23 @@ _TRACKING_QUERY_KEYS = {
 
 
 @dataclass(slots=True)
+class ImageReference:
+    """一张网页正文图片的下载地址、邻近说明和正文占位符。"""
+
+    url: str
+    description: str
+    marker: str
+
+
+@dataclass(slots=True)
 class ImageEvidence:
     """可送入视觉模型的一张规范化 PNG，并保留其来源编号。"""
 
     label: str
     png: bytes
     source_index: int
+    description: str = ""
+    marker: str | None = None
 
 
 @dataclass(slots=True)
@@ -124,9 +138,12 @@ class SourceDocument:
     media_type: str = "unknown"
     text: str = ""
     images: list[ImageEvidence] = field(default_factory=list)
+    image_table_results: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
     http_status: int | None = None
     retry_after_seconds: float | None = None
+    source_cooldown_until: float | None = None
+    source_failure_category: str | None = None
     browser_rendered: bool = False
     browser_fallback_reason: str | None = None
     cache_hit: bool = False
@@ -142,7 +159,7 @@ class BrowserChallengeError(RuntimeError):
 
 
 def normalize_source_url(url: str) -> str:
-    """生成稳定缓存 URL：去跟踪参数、片段，并把 GitHub blob 转为 raw 内容地址。"""
+    """生成稳定获取 URL，并优先转向来源官方提供的机器可读内容。"""
 
     parsed = urlparse(url.strip())
     host = (parsed.hostname or "").lower()
@@ -159,6 +176,26 @@ def normalize_source_url(url: str) -> str:
                 fragment="",
             )
             host = "raw.githubusercontent.com"
+            path = parsed.path
+    elif host in {"data.worldbank.org", "data.worldbank.org.cn"}:
+        parts = [part for part in path.split("/") if part]
+        locations = dict(parse_qsl(parsed.query)).get("locations", "")
+        if (
+            len(parts) == 2
+            and parts[0] == "indicator"
+            and re.fullmatch(r"[A-Za-z0-9_.-]+", parts[1])
+            and re.fullmatch(r"[A-Za-z0-9;]+", locations)
+        ):
+            # 数据门户首屏只显示最近值，但同页 HTML 明确链接其官方 API。直接使用中文 API
+            # 可保留完整历史序列并让地区、年份和值进入可确定性匹配的表格。
+            parsed = parsed._replace(
+                scheme="https",
+                netloc="api.worldbank.org",
+                path=f"/v2/zh/country/{locations}/indicator/{parts[1]}",
+                query=urlencode({"format": "json", "per_page": 20000}),
+                fragment="",
+            )
+            host = "api.worldbank.org"
             path = parsed.path
     port = parsed.port
     netloc = host if port is None else f"{host}:{port}"
@@ -184,6 +221,205 @@ def _persistent_cache_path(cache_key: str) -> Path:
     return get_settings().source_cache_root / digest[:2] / f"{digest}.json"
 
 
+def _source_cache_digest(value: str) -> str:
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _source_lock_path(cache_key: str) -> Path:
+    digest = _source_cache_digest(cache_key)
+    return get_settings().source_cache_root / "locks" / digest[:2] / f"{digest}.lock"
+
+
+def _source_failure_path(cache_key: str) -> Path:
+    digest = _source_cache_digest(cache_key)
+    return get_settings().source_cache_root / "failures" / digest[:2] / f"{digest}.json"
+
+
+def _source_host_state_path(hostname: str) -> Path:
+    digest = _source_cache_digest(hostname.lower())
+    return get_settings().source_cache_root / "hosts" / digest[:2] / f"{digest}.json"
+
+
+def _source_image_path(image_hash: str) -> Path:
+    return get_settings().source_cache_root / "images" / image_hash[:2] / f"{image_hash}.png"
+
+
+def _read_json_file(path: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError, ValueError, TypeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+        os.replace(temporary_name, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary_name)
+
+
+@contextlib.asynccontextmanager
+async def _cross_process_source_lock(cache_key: str):
+    """用共享缓存卷上的文件锁合并跨进程相同 URL 获取。"""
+
+    path = _source_lock_path(cache_key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    try:
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                await asyncio.sleep(0.1)
+        yield
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _active_source_cooldown(cache_key: str, normalized_url: str) -> dict[str, Any] | None:
+    """返回 URL 或域名仍生效的冷却状态，过期状态不阻止新请求。"""
+
+    hostname = (urlparse(normalized_url).hostname or "").lower()
+    states = [
+        state
+        for state in (
+            _read_json_file(_source_failure_path(cache_key)),
+            _read_json_file(_source_host_state_path(hostname)) if hostname else None,
+        )
+        if state and isinstance(state.get("blocked_until"), int | float)
+    ]
+    active = [state for state in states if float(state["blocked_until"]) > time.time()]
+    return max(active, key=lambda state: float(state["blocked_until"])) if active else None
+
+
+def _failure_category(document: SourceDocument) -> str | None:
+    error = document.error or ""
+    if document.http_status == 429:
+        return "THROTTLED"
+    if document.http_status == 403 or looks_like_challenge_page(error):
+        return "CHALLENGE"
+    if document.http_status in BROWSER_RETRYABLE_STATUSES or (
+        error and "unsupported content type" not in error and "HTTP 4" not in error
+    ):
+        return "TRANSIENT"
+    return None
+
+
+def _record_source_failure(
+    cache_key: str,
+    normalized_url: str,
+    document: SourceDocument,
+) -> None:
+    """把挑战/限流/瞬时错误写入共享负缓存，避免相同行继续撞站点。"""
+
+    category = _failure_category(document)
+    if category is None:
+        return
+    settings = get_settings()
+    path = _source_failure_path(cache_key)
+    previous = _read_json_file(path) or {}
+    failure_count = int(previous.get("failure_count") or 0) + 1
+    if category == "CHALLENGE":
+        cooldown = settings.source_challenge_cooldown_seconds
+    else:
+        cooldown = settings.source_transient_cooldown_base_seconds * (2 ** (failure_count - 1))
+    cooldown = min(settings.source_cooldown_max_seconds, max(cooldown, document.retry_after_seconds or 0))
+    blocked_until = time.time() + cooldown
+    state = {
+        "normalized_url": normalized_url,
+        "hostname": (urlparse(normalized_url).hostname or "").lower(),
+        "category": category,
+        "failure_count": failure_count,
+        "blocked_until": blocked_until,
+        "http_status": document.http_status,
+        "error": (document.error or "")[:500],
+        "updated_at": time.time(),
+    }
+    _write_json_file(path, state)
+    if category in {"CHALLENGE", "THROTTLED"} and state["hostname"]:
+        host_path = _source_host_state_path(state["hostname"])
+        existing = _read_json_file(host_path) or {}
+        if float(existing.get("blocked_until") or 0) < blocked_until:
+            _write_json_file(host_path, state)
+    document.source_cooldown_until = blocked_until
+    document.source_failure_category = category
+
+
+def _clear_source_failure(cache_key: str, normalized_url: str) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        _source_failure_path(cache_key).unlink()
+    hostname = (urlparse(normalized_url).hostname or "").lower()
+    if not hostname:
+        return
+    host_path = _source_host_state_path(hostname)
+    host_state = _read_json_file(host_path) or {}
+    # 同一 URL 的 Playwright 回退成功说明先前挑战已被正常公开页面化解；清除它设置的
+    # 域级冷却。其他 URL 更新的更晚冷却不能被这次成功误删。
+    if host_state.get("normalized_url") == normalized_url:
+        with contextlib.suppress(FileNotFoundError):
+            host_path.unlink()
+
+
+def _cooldown_document(
+    candidate: Any,
+    index: int,
+    normalized_url: str,
+    cache_key: str,
+    state: dict[str, Any],
+) -> SourceDocument:
+    remaining = max(0.0, float(state["blocked_until"]) - time.time())
+    return SourceDocument(
+        index=index,
+        url=normalized_url,
+        requested_url=candidate.source_url,
+        normalized_url=normalized_url,
+        cache_key=cache_key,
+        title=candidate.title,
+        snippet=candidate.excerpt,
+        error=f"source cooldown active: {state.get('category') or 'TRANSIENT'}",
+        retry_after_seconds=remaining,
+        source_cooldown_until=float(state["blocked_until"]),
+        source_failure_category=str(state.get("category") or "TRANSIENT"),
+    )
+
+
+async def _reserve_host_request_slot(normalized_url: str) -> None:
+    """跨进程预留域名访问时隙，使不同 URL 也遵守最小间隔。"""
+
+    interval = get_settings().source_host_min_interval_seconds
+    hostname = (urlparse(normalized_url).hostname or "").lower()
+    if not hostname or interval <= 0:
+        return
+    path = _source_host_state_path(hostname).with_suffix(".rate.json")
+    lock_path = path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    try:
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                await asyncio.sleep(0.05)
+        now = time.time()
+        previous = _read_json_file(path) or {}
+        scheduled_at = max(now, float(previous.get("reserved_at") or 0) + interval)
+        _write_json_file(path, {"hostname": hostname, "reserved_at": scheduled_at})
+    finally:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+    if scheduled_at > now:
+        await asyncio.sleep(scheduled_at - now)
+
+
 def _load_persistent_document(
     cache_key: str,
     candidate: Any,
@@ -205,14 +441,42 @@ def _load_persistent_document(
         time.time() - cached_at > get_settings().source_cache_ttl_seconds
     ):
         return None
+    images: list[ImageEvidence] = []
+    persisted_images = payload.get("images") if isinstance(payload.get("images"), list) else []
+    for item in persisted_images:
+        if not isinstance(item, dict) or not isinstance(item.get("image_hash"), str):
+            continue
+        try:
+            png = _source_image_path(item["image_hash"]).read_bytes()
+        except OSError:
+            continue
+        if hashlib.sha256(png).hexdigest() != item["image_hash"]:
+            continue
+        images.append(
+            ImageEvidence(
+                label=str(item.get("label") or f"Source {index}, cached image"),
+                png=png,
+                source_index=index,
+                description=str(item.get("description") or ""),
+                marker=item.get("marker") if isinstance(item.get("marker"), str) else None,
+            )
+        )
+    image_table_results = (
+        payload.get("image_table_results") if isinstance(payload.get("image_table_results"), list) else []
+    )
+    # 待识别图片元数据存在但对象丢失时不能返回只剩占位符的正文；重新抓取才能恢复证据。
+    if persisted_images and not images and not image_table_results:
+        return None
     document = SourceDocument(
         index=index,
         url=payload.get("final_url") or normalized_url,
         requested_url=candidate.source_url,
-        title=candidate.title or payload.get("title"),
-        snippet=candidate.excerpt or payload.get("snippet"),
+        title=payload.get("title") or candidate.title,
+        snippet=payload.get("snippet") or candidate.excerpt,
         media_type=payload.get("media_type") or "unknown",
         text=payload.get("text") or "",
+        images=images,
+        image_table_results=image_table_results,
         http_status=payload.get("http_status"),
         browser_rendered=payload.get("browser_rendered") is True,
         browser_fallback_reason=payload.get("browser_fallback_reason"),
@@ -232,6 +496,28 @@ def _persist_document(cache_key: str, document: SourceDocument) -> None:
         return
     path = _persistent_cache_path(cache_key)
     path.parent.mkdir(parents=True, exist_ok=True)
+    persisted_images: list[dict[str, Any]] = []
+    for image in document.images:
+        image_hash = hashlib.sha256(image.png).hexdigest()
+        image_path = _source_image_path(image_hash)
+        if not image_path.exists():
+            image_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary_name = tempfile.mkstemp(prefix=f".{image_path.name}.", dir=image_path.parent)
+            try:
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(image.png)
+                os.replace(temporary_name, image_path)
+            finally:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(temporary_name)
+        persisted_images.append(
+            {
+                "image_hash": image_hash,
+                "label": image.label,
+                "description": image.description,
+                "marker": image.marker,
+            }
+        )
     payload = {
         "parser_version": _PARSER_VERSION,
         "cached_at": time.time(),
@@ -242,27 +528,24 @@ def _persist_document(cache_key: str, document: SourceDocument) -> None:
         "snippet": document.snippet,
         "media_type": document.media_type,
         "text": document.text,
+        "images": persisted_images,
+        "image_table_results": document.image_table_results,
         "http_status": document.http_status,
         "browser_rendered": document.browser_rendered,
         "browser_fallback_reason": document.browser_fallback_reason,
         "content_hash": document.content_hash or hashlib.sha256(document.text.encode()).hexdigest(),
     }
-    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
-        os.replace(temporary_name, path)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            os.unlink(temporary_name)
+    _write_json_file(path, payload)
 
 
 def _cached_document(document: SourceDocument, candidate: Any, index: int) -> SourceDocument:
     cloned = copy.deepcopy(document)
     cloned.index = index
     cloned.requested_url = candidate.source_url
-    cloned.title = candidate.title or cloned.title
-    cloned.snippet = candidate.excerpt or cloned.snippet
+    # 来源证据元数据属于共享前缀；缓存命中时保留首次规范化结果，避免行级候选标题
+    # 改变 OMLX 前缀并降低相同 URL 的 KV cache 命中率。
+    cloned.title = cloned.title or candidate.title
+    cloned.snippet = cloned.snippet or candidate.excerpt
     cloned.cache_hit = True
     cloned.normalized_url = normalize_source_url(candidate.source_url)
     for image in cloned.images:
@@ -270,9 +553,81 @@ def _cached_document(document: SourceDocument, candidate: Any, index: int) -> So
     return cloned
 
 
+def persist_enriched_source_document(document: SourceDocument) -> None:
+    """在图片表格化后更新进程内和跨任务缓存。
+
+    图片模型输出已经嵌回 ``document.text``，持久化后同一来源的其他行可以
+    直接复用，不再重复下载或识图。
+    """
+
+    cache_key = document.cache_key or document.normalized_url
+    if not cache_key or document.error or not document.text:
+        return
+    if len(_SOURCE_CACHE) >= _SOURCE_CACHE_MAX_ITEMS and cache_key not in _SOURCE_CACHE:
+        _SOURCE_CACHE.pop(next(iter(_SOURCE_CACHE)))
+    _SOURCE_CACHE[cache_key] = copy.deepcopy(document)
+    _persist_document(cache_key, document)
+
+
 def _decode_text(data: bytes) -> str:
     match = from_bytes(data).best()
     return str(match) if match is not None else data.decode("utf-8", errors="replace")
+
+
+def compact_json_records(data: bytes) -> str | None:
+    """把 JSON 中最大的同构对象数组转成 CSV，供通用结构化匹配和模型复核。"""
+
+    try:
+        payload = json.loads(_decode_text(data))
+    except json.JSONDecodeError, UnicodeError:
+        return None
+
+    candidates: list[list[dict[str, Any]]] = []
+
+    def visit(value: Any, depth: int = 0) -> None:
+        if depth > 5:
+            return
+        if isinstance(value, list):
+            if value and all(isinstance(item, dict) for item in value):
+                candidates.append(value)
+            for item in value:
+                visit(item, depth + 1)
+        elif isinstance(value, dict):
+            for item in value.values():
+                visit(item, depth + 1)
+
+    visit(payload)
+    if not candidates:
+        return None
+    records = max(candidates, key=len)[:20_000]
+
+    flattened: list[dict[str, Any]] = []
+    columns: list[str] = []
+    for record in records:
+        row: dict[str, Any] = {}
+        for key, value in record.items():
+            if value is None or isinstance(value, str | int | float | bool):
+                row[str(key)] = value
+            elif isinstance(value, dict):
+                # 常见统计 API 用 {id, value} 表示国家、指标等实体；把展示值放在原列名，
+                # 同时保留其 id，既方便中文地区匹配也不丢失机器标识。
+                if value.get("value") is None or isinstance(value.get("value"), str | int | float | bool):
+                    row[str(key)] = value.get("value")
+                if value.get("id") is None or isinstance(value.get("id"), str | int | float | bool):
+                    row[f"{key}_id"] = value.get("id")
+        for key in row:
+            if key not in columns and len(columns) < 32:
+                columns.append(key)
+        flattened.append(row)
+    if not columns:
+        return None
+
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerow(columns)
+    for row in flattened:
+        writer.writerow([row.get(column) for column in columns])
+    return _normalize_text(output.getvalue())
 
 
 def _normalize_text(text: str) -> str:
@@ -288,6 +643,8 @@ def looks_like_challenge_page(text: str) -> bool:
 
 def browser_fallback_reason(document: SourceDocument, *, min_content_chars: int) -> str | None:
     """判断是否需要浏览器重试，并返回可审计原因；附件类型不走浏览器。"""
+    if document.error and document.error.startswith("source cooldown active:"):
+        return None
     if (urlparse(document.url).hostname or "").lower() == "api.github.com":
         # 结构化 API 的限流或鉴权错误必须由 HTTP 重试处理；浏览器渲染既不能修复响应，也会
         # 把错误页误当证据并显著拖慢固定榜单任务。
@@ -307,8 +664,46 @@ def browser_fallback_reason(document: SourceDocument, *, min_content_chars: int)
     return None
 
 
-def extract_html_main_content(data: bytes, base_url: str) -> tuple[str, list[tuple[str, str]]]:
-    """抽取网页主正文，并按尺寸、替代文本和噪声规则筛选最多两张相关图片。"""
+def _compact_image_description(image: Tag) -> str:
+    """提取带类型标签的图注、图片属性和邻近正文，供视觉模型联合判断。"""
+
+    candidates: list[tuple[str, str]] = []
+    for attribute in ("alt", "title", "data-caption", "aria-label"):
+        value = image.get(attribute)
+        if isinstance(value, str) and value.strip():
+            candidates.append((attribute, value.strip()))
+    figure = image.find_parent("figure")
+    if isinstance(figure, Tag):
+        caption = figure.find("figcaption")
+        if isinstance(caption, Tag):
+            candidates.insert(0, ("图注", caption.get_text(" ", strip=True)))
+
+    nearby: list[str] = []
+    for tag in image.find_all_previous(["p", "figcaption"], limit=3):
+        text = tag.get_text(" ", strip=True)
+        if text:
+            nearby.append(text)
+    # “图说/图表/排名”类说明比普通前文更可能真正描述当前图片。
+    nearby.sort(
+        key=lambda value: (
+            bool(re.search(r"(?:图说|图表|排名|得分|chart|table|figure)", value, re.I)),
+            -len(value),
+        ),
+        reverse=True,
+    )
+    candidates.extend(("邻近正文", value) for value in nearby[:1])
+    cleaned: list[str] = []
+    seen_values: set[str] = set()
+    for label, value in candidates:
+        normalized = re.sub(r"\s+", " ", value).strip()
+        if normalized and normalized not in seen_values:
+            seen_values.add(normalized)
+            cleaned.append(f"{label}: {normalized[:300]}")
+    return " | ".join(cleaned)[:600]
+
+
+def extract_html_main_content(data: bytes, base_url: str) -> tuple[str, list[ImageReference]]:
+    """抽取网页主正文，并保留最多六张候选正文图片在文本中的位置。"""
 
     html_text = _decode_text(data)
     # 福布斯列表页的完整 50 条数据位于 Next.js 内嵌状态而非首屏正文。先压缩为仅含业务字段
@@ -321,42 +716,57 @@ def extract_html_main_content(data: bytes, base_url: str) -> tuple[str, list[tup
         forbes_snapshot = ""
     if forbes_snapshot is not None:
         return _normalize_text(forbes_snapshot), []
-    extracted = trafilatura.extract(
-        html_text,
-        include_comments=False,
-        include_tables=True,
-        favor_precision=True,
-        no_fallback=False,
-    )
     soup = BeautifulSoup(html_text, "lxml")
     for tag in soup.find_all(BOILERPLATE_TAGS):
         tag.decompose()
     container = soup.find("main") or soup.find("article") or soup.find(attrs={"role": "main"})
     if not isinstance(container, Tag):
         container = soup.body if isinstance(soup.body, Tag) else soup
-    fallback = container.get_text("\n", strip=True)
-    text = _normalize_text(extracted or fallback)
-
-    ranked_images: list[tuple[int, str, str]] = []
-    for image in container.find_all("img"):
+    ranked_images: list[tuple[int, int, Tag, str, str]] = []
+    for order, image in enumerate(container.find_all("img")):
         src = image.get("data-src") or image.get("src")
         if not isinstance(src, str) or not src.strip():
             continue
-        alt = " ".join(
-            str(value) for value in (image.get("alt"), image.get("title"), image.get("class")) if value
-        ).strip()
+        description = _compact_image_description(image)
+        class_text = " ".join(str(value) for value in image.get("class", []))
         absolute = urljoin(base_url, src.strip())
         if urlparse(absolute).scheme not in {"http", "https"}:
             continue
-        noisy = bool(NOISY_IMAGE_PATTERN.search(absolute + " " + alt))
+        noisy = bool(NOISY_IMAGE_PATTERN.search(absolute + " " + description + " " + class_text))
         width = int(image.get("width", 0)) if str(image.get("width", "")).isdigit() else 0
         height = int(image.get("height", 0)) if str(image.get("height", "")).isdigit() else 0
         if noisy or (width and width < 160) or (height and height < 100):
             continue
-        score = (2 if alt else 0) + (1 if width >= 500 or height >= 300 else 0)
-        ranked_images.append((score, absolute, alt))
-    ranked_images.sort(key=lambda item: item[0], reverse=True)
-    return text, [(url, alt) for _, url, alt in ranked_images[:MAX_IMAGES_PER_SOURCE]]
+        data_hint = bool(
+            re.search(r"(?:图说|图表|排名|得分|指数|chart|table|figure|rank)", description, re.I)
+        )
+        score = (
+            (3 if data_hint else 0) + (2 if description else 0) + (1 if width >= 500 or height >= 300 else 0)
+        )
+        ranked_images.append((score, order, image, absolute, description))
+
+    selected = sorted(
+        sorted(ranked_images, key=lambda item: (item[0], -item[1]), reverse=True)[:MAX_IMAGES_PER_SOURCE],
+        key=lambda item: item[1],
+    )
+    references: list[ImageReference] = []
+    for position, (_, _, image, absolute, description) in enumerate(selected, start=1):
+        marker = f"[[METRIC_PULSE_IMAGE:{position}]]"
+        marker_tag = soup.new_tag("p")
+        marker_tag.string = marker
+        image.insert_after(marker_tag)
+        references.append(ImageReference(url=absolute, description=description, marker=marker))
+
+    extracted = trafilatura.extract(
+        str(soup),
+        include_comments=False,
+        include_tables=True,
+        favor_precision=True,
+        no_fallback=False,
+    )
+    fallback = container.get_text("\n", strip=True)
+    text = _normalize_text(extracted or fallback)
+    return text, references
 
 
 def extract_pdf(data: bytes, source_index: int) -> tuple[str, list[ImageEvidence]]:
@@ -489,14 +899,19 @@ async def _download(
 
 async def _download_html_images(
     client: httpx.AsyncClient,
-    references: list[tuple[str, str]],
+    references: list[ImageReference],
     source_index: int,
     validate_url: Callable[[str], Awaitable[None]],
 ) -> list[ImageEvidence]:
     images: list[ImageEvidence] = []
-    for url, alt in references:
+    for reference in references:
         try:
-            _, media_type, data = await _download(client, url, validate_url, max_bytes=6_000_000)
+            _, media_type, data = await _download(
+                client,
+                reference.url,
+                validate_url,
+                max_bytes=6_000_000,
+            )
         except httpx.HTTPError, ValueError:
             continue
         if not media_type.startswith("image/"):
@@ -505,9 +920,11 @@ async def _download_html_images(
         if converted:
             images.append(
                 ImageEvidence(
-                    label=f"Source {source_index}, {alt or 'web image'}",
+                    label=f"Source {source_index}, {reference.description or 'web image'}",
                     png=converted,
                     source_index=source_index,
+                    description=reference.description,
+                    marker=reference.marker,
                 )
             )
     return images
@@ -559,12 +976,16 @@ async def fetch_source_document(
             converted = normalize_image(data)
             if converted:
                 document.images = [ImageEvidence(f"Source {index}, image", converted, index)]
-        elif (
-            media_type.startswith("text/")
-            or media_type == "application/json"
-            or media_type.endswith("+json")
-            or suffix in {".csv", ".tsv", ".json", ".xml"}
-        ):
+        elif media_type == "application/json" or media_type.endswith("+json") or suffix == ".json":
+            raw_text = _normalize_text(_decode_text(data))
+            # GitHub 月榜有专用完整性、排序和 Top10 解析器，必须保留原始响应；其他普通
+            # JSON 来源优先压成表格，无法识别同构记录数组时再退回原文。
+            document.text = (
+                raw_text
+                if (urlparse(final_url).hostname or "").lower() == "api.github.com"
+                else compact_json_records(data) or raw_text
+            )
+        elif media_type.startswith("text/") or suffix in {".csv", ".tsv", ".xml"}:
             document.text = _normalize_text(_decode_text(data))
         else:
             document.error = f"unsupported content type: {media_type or suffix or 'unknown'}"
@@ -790,38 +1211,49 @@ async def gather_source_documents(
             if cached is not None:
                 return _cached_document(cached, candidate, index)
             lock = _SOURCE_CACHE_LOCKS.setdefault(cache_key, asyncio.Lock())
-            async with lock:
-                cached = _SOURCE_CACHE.get(cache_key)
-                if cached is not None:
-                    return _cached_document(cached, candidate, index)
-                persistent = _load_persistent_document(
-                    cache_key,
-                    candidate,
-                    index,
-                    normalized_url,
-                )
-                if persistent is not None:
-                    if len(_SOURCE_CACHE) >= _SOURCE_CACHE_MAX_ITEMS:
-                        _SOURCE_CACHE.pop(next(iter(_SOURCE_CACHE)))
-                    _SOURCE_CACHE[cache_key] = copy.deepcopy(persistent)
-                    return persistent
-                async with semaphore:
-                    normalized_candidate = copy.copy(candidate)
-                    normalized_candidate.source_url = normalized_url
-                    document = await fetch_source_document(
-                        normalized_candidate,
+            async with lock:  # noqa: SIM117 - 分层显示进程内锁和跨进程锁的边界
+                async with _cross_process_source_lock(cache_key):
+                    cached = _SOURCE_CACHE.get(cache_key)
+                    if cached is not None:
+                        return _cached_document(cached, candidate, index)
+                    persistent = _load_persistent_document(
+                        cache_key,
+                        candidate,
                         index,
-                        client,
-                        validate_url,
+                        normalized_url,
                     )
-                document.requested_url = candidate.source_url
-                document.normalized_url = normalized_url
-                document.cache_key = cache_key
-                if not document.error and (document.text or document.images):
-                    if len(_SOURCE_CACHE) >= _SOURCE_CACHE_MAX_ITEMS:
-                        _SOURCE_CACHE.pop(next(iter(_SOURCE_CACHE)))
-                    _SOURCE_CACHE[cache_key] = copy.deepcopy(document)
-                return document
+                    if persistent is not None:
+                        if len(_SOURCE_CACHE) >= _SOURCE_CACHE_MAX_ITEMS:
+                            _SOURCE_CACHE.pop(next(iter(_SOURCE_CACHE)))
+                        _SOURCE_CACHE[cache_key] = copy.deepcopy(persistent)
+                        return persistent
+                    cooldown = _active_source_cooldown(cache_key, normalized_url)
+                    if cooldown is not None:
+                        return _cooldown_document(candidate, index, normalized_url, cache_key, cooldown)
+                    await _reserve_host_request_slot(normalized_url)
+                    async with semaphore:
+                        normalized_candidate = copy.copy(candidate)
+                        normalized_candidate.source_url = normalized_url
+                        document = await fetch_source_document(
+                            normalized_candidate,
+                            index,
+                            client,
+                            validate_url,
+                        )
+                    document.requested_url = candidate.source_url
+                    document.title = document.title or candidate.title
+                    document.snippet = document.snippet or candidate.excerpt
+                    document.normalized_url = normalized_url
+                    document.cache_key = cache_key
+                    if document.error:
+                        _record_source_failure(cache_key, normalized_url, document)
+                    elif document.text or document.images:
+                        _clear_source_failure(cache_key, normalized_url)
+                        if len(_SOURCE_CACHE) >= _SOURCE_CACHE_MAX_ITEMS:
+                            _SOURCE_CACHE.pop(next(iter(_SOURCE_CACHE)))
+                        _SOURCE_CACHE[cache_key] = copy.deepcopy(document)
+                        _persist_document(cache_key, document)
+                    return document
 
         documents = list(
             await asyncio.gather(
@@ -839,15 +1271,26 @@ async def gather_source_documents(
                 site_cooldown_seconds=browser_site_cooldown_seconds,
             )
         for document in documents:
-            cache_key = document.cache_key or document.normalized_url or normalize_source_url(
-                document.requested_url or document.url
+            cache_key = (
+                document.cache_key
+                or document.normalized_url
+                or normalize_source_url(document.requested_url or document.url)
             )
             if not document.error and document.text:
+                _clear_source_failure(cache_key, document.normalized_url or document.url)
+                document.source_cooldown_until = None
+                document.source_failure_category = None
                 document.content_hash = (
                     document.content_hash or hashlib.sha256(document.text.encode()).hexdigest()
                 )
                 _SOURCE_CACHE[cache_key] = copy.deepcopy(document)
                 _persist_document(cache_key, document)
+            elif document.error and document.source_cooldown_until is None:
+                _record_source_failure(
+                    cache_key,
+                    document.normalized_url or document.url,
+                    document,
+                )
         return documents
 
 

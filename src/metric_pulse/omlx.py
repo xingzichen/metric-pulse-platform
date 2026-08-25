@@ -93,6 +93,7 @@ class OMLXClient:
         system: str,
         prompt: str,
         image_png: bytes | None = None,
+        max_output_tokens: int | None = None,
     ) -> dict[str, Any]:
         """发送一次非流式请求并把响应规范化为单个 JSON 对象。
 
@@ -118,7 +119,11 @@ class OMLXClient:
                 {"role": "user", "content": user_content},
             ],
             "temperature": 0,
-            "max_tokens": self.settings.omlx_max_output_tokens,
+            "max_tokens": (
+                max_output_tokens
+                if max_output_tokens is not None
+                else self.settings.omlx_max_output_tokens
+            ),
             "stream": False,
             "chat_template_kwargs": {"enable_thinking": False},
         }
@@ -142,6 +147,8 @@ class OMLXClient:
                 "response_id": response_payload.get("id"),
             }
             content = response_payload["choices"][0]["message"]["content"]
+            finish_reason = response_payload["choices"][0].get("finish_reason")
+            self.last_response_metadata["finish_reason"] = finish_reason
             if not isinstance(content, str):
                 raise OMLXError("OMLX returned non-text structured content")
             parsed = json.loads(JSON_FENCE.sub("", content).strip())
@@ -185,4 +192,5 @@ class OMLXClient:
             ),
             prompt=prompt,
             image_png=preview,
+            max_output_tokens=self.settings.sheet_analysis_max_output_tokens,
         )

@@ -23,6 +23,7 @@ os.environ.update(
         "MP_BOOTSTRAP_USERNAME": "admin",
         "MP_BOOTSTRAP_PASSWORD": "test-password",
         "MP_VISION_ANALYSIS_ENABLED": "false",
+        "MP_SOURCE_HOST_MIN_INTERVAL_SECONDS": "0",
         "MP_EAGER_TASKS": "true",
     }
 )
