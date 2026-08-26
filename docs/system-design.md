@@ -453,7 +453,7 @@ UNREVIEWED → AUTO_APPROVED
            → SKIPPED
 ```
 
-`AUTO_APPROVED` 必须保存 ReviewPolicy 版本、规则输入、命中理由和抽样结果。`CONFIRMED_UNRESOLVED` 表示人工确认当前无可靠值，导出可保留空值但必须在未解决报告中列出。`SKIPPED` 只能用于配置明确允许不纳入本次导出范围的可选项，不得规避必需结果。
+`AUTO_APPROVED` 必须保存 ReviewPolicy 版本、规则输入、命中理由和抽样结果。`CONFIRMED_UNRESOLVED` 表示人工确认当前无可靠值，导出可保留空值但必须在未解决报告中列出。`FAILED_FINAL` 是已执行异常，必须进入人工队列；人工可完整补录为 `CORRECTED + RESOLVED`，或确认无法解决，也可驳回重采，但不得直接批准且不得覆盖执行失败事实。`SKIPPED` 只能用于配置明确允许不纳入本次导出范围的可选项，不得规避必需结果。
 
 “已核对”是完成态指标，只统计 `AUTO_APPROVED/APPROVED/CORRECTED/CONFIRMED_UNRESOLVED/SKIPPED`。`REJECTED` 是触发重采的过程决定，不计入已核对；驳回历史保存在不可变审核决定中，重采开始时当前审核状态回到 `UNREVIEWED`，等待新结果再次审核。
 

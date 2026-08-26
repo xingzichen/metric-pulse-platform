@@ -68,6 +68,7 @@ export interface Task {
     discarded?: number;
     reviewed?: number;
     resolved?: number;
+    retryable?: number;
     executionCounts?: Record<string, number>;
     resolutionCounts?: Record<string, number>;
     reviewCounts?: Record<string, number>;
@@ -112,7 +113,19 @@ export interface Unit {
   };
   evidence?: Evidence[];
   acquisitionAttempts?: SourceAcquisitionAttempt[];
+  collectionAttempts?: CollectionAttempt[];
   history?: unknown[];
+}
+export interface CollectionAttempt {
+  id: string;
+  step: string;
+  status: string;
+  inputSummary: Record<string, unknown>;
+  outputSummary: Record<string, unknown>;
+  model?: string | null;
+  error?: string | null;
+  startedAt: string;
+  endedAt?: string | null;
 }
 export interface SourceAcquisitionAttempt {
   id: string;

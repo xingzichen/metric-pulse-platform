@@ -52,8 +52,12 @@ def allowed_actions(status: str | TaskStatus) -> list[str]:
 
     value = TaskStatus(status)
     actions: list[str] = []
-    if value in {TaskStatus.DRAFT, TaskStatus.PAUSED, TaskStatus.FAILED, TaskStatus.SUCCEEDED_WITH_ERRORS}:
-        actions.append("start" if value == TaskStatus.DRAFT else "resume")
+    if value == TaskStatus.DRAFT:
+        actions.append("start")
+    elif value == TaskStatus.PAUSED:
+        actions.append("resume")
+    elif value in {TaskStatus.FAILED, TaskStatus.SUCCEEDED_WITH_ERRORS}:
+        actions.append("retry")
     if value == TaskStatus.RUNNING:
         actions.extend(["pause", "stop"])
     if value in {TaskStatus.QUEUED, TaskStatus.PAUSING, TaskStatus.PAUSED}:

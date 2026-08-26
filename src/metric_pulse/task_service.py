@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from .dataset_profiles import (
@@ -53,6 +53,18 @@ COMPLETED_REVIEW_STATUSES = {
     ReviewStatus.CONFIRMED_UNRESOLVED,
     ReviewStatus.SKIPPED,
 }
+
+
+def retry_candidate_condition():
+    """返回只覆盖未人工闭环或明确要求重采单元的统一筛选条件。"""
+
+    return or_(
+        CollectionUnit.status.in_([UnitStatus.PENDING, UnitStatus.FAILED_RETRYABLE]),
+        and_(
+            CollectionUnit.status == UnitStatus.FAILED_FINAL,
+            CollectionUnit.review_status.in_([ReviewStatus.UNREVIEWED, ReviewStatus.REJECTED]),
+        ),
+    )
 
 
 def add_event(db: Session, task_id: str, event_type: str, payload: dict[str, Any]) -> None:
@@ -361,6 +373,15 @@ def refresh_stats(db: Session, task: CollectionTask) -> dict[str, Any]:
     )
     total = sum(unit_counts.values())
     reviewed = sum(review_counts.get(status, 0) for status in COMPLETED_REVIEW_STATUSES)
+    retryable = (
+        db.scalar(
+            select(func.count(CollectionUnit.id)).where(
+                CollectionUnit.task_id == task.id,
+                retry_candidate_condition(),
+            )
+        )
+        or 0
+    )
     stats = {
         "total": total,
         "pending": unit_counts.get(UnitStatus.PENDING, 0) + unit_counts.get(UnitStatus.FAILED_RETRYABLE, 0),
@@ -370,6 +391,7 @@ def refresh_stats(db: Session, task: CollectionTask) -> dict[str, Any]:
         "discarded": unit_counts.get(UnitStatus.DISCARDED, 0),
         "reviewed": reviewed,
         "resolved": resolution_counts.get(ResolutionStatus.RESOLVED, 0),
+        "retryable": retryable,
         "executionCounts": {str(key): value for key, value in unit_counts.items()},
         "resolutionCounts": {str(key): value for key, value in resolution_counts.items()},
         "reviewCounts": {str(key): value for key, value in review_counts.items()},
@@ -422,12 +444,21 @@ def start_task(db: Session, task: CollectionTask, actor: User | None = None) -> 
             .values(run_version=task.run_version)
         )
     elif task.status in {TaskStatus.FAILED, TaskStatus.SUCCEEDED_WITH_ERRORS}:
+        retryable = db.scalar(
+            select(func.count(CollectionUnit.id)).where(
+                CollectionUnit.task_id == task.id,
+                retry_candidate_condition(),
+            )
+        )
+        if not retryable:
+            raise ValueError("No unhandled or rejected failed units remain to retry")
         task.run_version += 1
         db.execute(
             CollectionUnit.__table__.update()
             .where(
                 CollectionUnit.task_id == task.id,
                 CollectionUnit.status.in_([UnitStatus.FAILED_FINAL, UnitStatus.FAILED_RETRYABLE]),
+                CollectionUnit.review_status.in_([ReviewStatus.UNREVIEWED, ReviewStatus.REJECTED]),
             )
             .values(status=UnitStatus.PENDING, run_version=task.run_version, error=None)
         )

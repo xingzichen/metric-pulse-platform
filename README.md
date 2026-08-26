@@ -21,7 +21,7 @@
 - 规范 URL 的正文、原图和图片派生表持久化到共享 `source-cache-data`；挑战/限流建立 URL 与域级负缓存，避免重复抓取触发验证页；
 - execution/resolution/review 三套正交状态、原因/风险分类与独立统计；
 - 原始数据、行约束、模型建议、校验过程、证据和审核历史的异常优先核对；
-- ReviewPolicy 自动通过/抽样/熔断、快照式批量 preview/commit、`CONFIRMED_UNRESOLVED` 与未解决报告；
+- ReviewPolicy 自动通过/抽样/熔断、快照式批量 preview/commit、`FAILED_FINAL` 人工补录/确认无法解决、`CONFIRMED_UNRESOLVED` 与未解决报告；
 - 严格审核门禁、导出失效管理和保留格式的 Excel 回写；
 - Vue 3 + Element Plus Web 工作台，Vue Router 5 自动文件路由；
 - Alembic 初始及 P0 迁移、API/worker/web Docker 镜像和 Compose 编排。

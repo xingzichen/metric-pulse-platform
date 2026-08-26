@@ -18,6 +18,7 @@ from metric_pulse.dataset_profiles import (
 )
 from metric_pulse.db import SessionLocal
 from metric_pulse.models import (
+    CollectionAttempt,
     CollectionTask,
     CollectionUnit,
     DataRecord,
@@ -25,6 +26,7 @@ from metric_pulse.models import (
     FileRecord,
     FileStatus,
     ResolutionStatus,
+    ReviewDecision,
     ReviewPolicy,
     ReviewStatus,
     RiskLevel,
@@ -150,6 +152,191 @@ def test_rejected_review_becomes_retryable_and_clears_review(client) -> None:
     assert task.status == TaskStatus.QUEUED
     assert unit.review_status == ReviewStatus.UNREVIEWED
     assert unit.run_version == task.run_version
+    db.close()
+
+
+def test_final_failed_unit_is_exposed_with_attempts_in_review_queue(client) -> None:
+    db, _, task, unit = _task_with_unit(
+        task_status=TaskStatus.SUCCEEDED_WITH_ERRORS,
+        unit_status=UnitStatus.FAILED_FINAL,
+    )
+    unit.error = "model protocol error"
+    db.add(
+        CollectionAttempt(
+            unit_id=unit.id,
+            step="VERIFY",
+            status="FAILED",
+            input_summary={"evidence_count": 2},
+            output_summary={"finish_reason": "stop"},
+            model="Qwen3.8-27B-6bit",
+            error="invalid JSON",
+        )
+    )
+    db.commit()
+    task_id, unit_id = task.id, unit.id
+    db.close()
+
+    queue = client.get(
+        f"/api/v1/tasks/{task_id}/review-queue",
+        params={"reviewStatus": "UNREVIEWED", "executionStatus": "FAILED_FINAL"},
+    )
+    assert queue.status_code == 200, queue.text
+    assert queue.json()["total"] == 1
+    assert queue.json()["items"][0]["id"] == unit_id
+    assert queue.json()["items"][0]["executionStatus"] == "FAILED_FINAL"
+    assert queue.json()["items"][0]["record"]["sourceRow"] == 2
+
+    context = client.get(f"/api/v1/review-units/{unit_id}")
+    assert context.status_code == 200, context.text
+    assert context.json()["error"] == "model protocol error"
+    assert context.json()["collectionAttempts"][0]["step"] == "VERIFY"
+    assert context.json()["collectionAttempts"][0]["error"] == "invalid JSON"
+
+
+def test_final_failed_unit_can_be_fully_corrected_without_hiding_failure(client) -> None:
+    db, user, task, unit = _task_with_unit(
+        task_status=TaskStatus.SUCCEEDED_WITH_ERRORS,
+        unit_status=UnitStatus.FAILED_FINAL,
+    )
+    unit.error = "source unavailable"
+    db.commit()
+
+    with pytest.raises(ValueError, match="requires an audit comment"):
+        review_unit(
+            db,
+            unit=unit,
+            actor=user,
+            decision=ReviewStatus.CORRECTED,
+            expected_version=unit.version,
+            values={"result": "manually verified"},
+        )
+    with pytest.raises(ValueError, match="no machine suggestion"):
+        review_unit(
+            db,
+            unit=unit,
+            actor=user,
+            decision=ReviewStatus.APPROVED,
+            expected_version=unit.version,
+        )
+
+    review_unit(
+        db,
+        unit=unit,
+        actor=user,
+        decision=ReviewStatus.CORRECTED,
+        expected_version=unit.version,
+        values={"result": "manually verified"},
+        comment="Checked the official report and entered the published value.",
+    )
+
+    assert unit.status == UnitStatus.FAILED_FINAL
+    assert unit.error == "source unavailable"
+    assert unit.resolution_status == ResolutionStatus.RESOLVED
+    assert unit.resolution_reason == "HUMAN_CORRECTION"
+    assert unit.review_status == ReviewStatus.CORRECTED
+    assert unit.final_values == {"result": "manually verified"}
+    decision = db.scalar(select(ReviewDecision).where(ReviewDecision.unit_id == unit.id))
+    assert decision.metadata_json["execution_status_before"] == UnitStatus.FAILED_FINAL
+    assert decision.metadata_json["execution_error_before"] == "source unavailable"
+    assert export_readiness(db, task.id)["ready"] is True
+    db.close()
+
+
+def test_final_failed_unit_can_be_confirmed_unresolved_for_export(client) -> None:
+    db, user, task, unit = _task_with_unit(
+        task_status=TaskStatus.SUCCEEDED_WITH_ERRORS,
+        unit_status=UnitStatus.FAILED_FINAL,
+    )
+    unit.error = "official source remained unavailable after retries"
+    db.commit()
+
+    assert export_readiness(db, task.id)["blockers"] == [
+        {"code": "FAILED_NOT_HANDLED", "count": 1}
+    ]
+    review_unit(
+        db,
+        unit=unit,
+        actor=user,
+        decision=ReviewStatus.CONFIRMED_UNRESOLVED,
+        expected_version=unit.version,
+        comment="Checked the official archive and no safe replacement source exists.",
+    )
+
+    assert unit.status == UnitStatus.FAILED_FINAL
+    assert unit.resolution_status == ResolutionStatus.UNRESOLVED
+    assert unit.resolution_reason == "HUMAN_CONFIRMED_AFTER_EXECUTION_FAILURE"
+    assert unit.review_status == ReviewStatus.CONFIRMED_UNRESOLVED
+    assert unit.final_values == {}
+    assert export_readiness(db, task.id)["ready"] is True
+    db.close()
+
+
+def test_whole_task_retry_does_not_reopen_manually_handled_final_failure(client) -> None:
+    db, user, task, unit = _task_with_unit(
+        task_status=TaskStatus.SUCCEEDED_WITH_ERRORS,
+        unit_status=UnitStatus.FAILED_FINAL,
+    )
+    review_unit(
+        db,
+        unit=unit,
+        actor=user,
+        decision=ReviewStatus.CORRECTED,
+        expected_version=unit.version,
+        values={"result": "manual final value"},
+        comment="Verified against the official source.",
+    )
+    handled_run_version = unit.run_version
+
+    with pytest.raises(ValueError, match="No unhandled or rejected"):
+        start_task(db, task, user)
+    db.refresh(unit)
+
+    assert task.status == TaskStatus.SUCCEEDED_WITH_ERRORS
+    assert unit.status == UnitStatus.FAILED_FINAL
+    assert unit.run_version == handled_run_version
+    assert unit.review_status == ReviewStatus.CORRECTED
+    assert unit.resolution_status == ResolutionStatus.RESOLVED
+    assert unit.final_values == {"result": "manual final value"}
+    assert task.stats["retryable"] == 0
+    task_id, task_version = task.id, task.version
+    db.close()
+
+    task_payload = client.get(f"/api/v1/tasks/{task_id}").json()
+    assert "retry" not in task_payload["allowedActions"]
+    assert client.get(f"/api/v1/tasks/{task_id}/review-queue").json()["total"] == 0
+    corrected_history = client.get(
+        f"/api/v1/tasks/{task_id}/review-queue",
+        params={"reviewStatus": "CORRECTED"},
+    ).json()
+    assert corrected_history["total"] == 1
+    retry = client.post(
+        f"/api/v1/tasks/{task_id}/retry",
+        json={"expected_version": task_version},
+    )
+    assert retry.status_code == 409
+    assert "No unhandled or rejected" in retry.text
+
+
+def test_monthly_top10_confirmed_unresolved_keeps_atomic_export_blocked(client) -> None:
+    db, user, task, unit = _task_with_unit(
+        task_status=TaskStatus.SUCCEEDED_WITH_ERRORS,
+        unit_status=UnitStatus.FAILED_FINAL,
+    )
+    unit.record.row_contract = {"profile": "ai_algorithm_collection_monthly_v1"}
+    db.commit()
+
+    review_unit(
+        db,
+        unit=unit,
+        actor=user,
+        decision=ReviewStatus.CONFIRMED_UNRESOLVED,
+        expected_version=unit.version,
+        comment="No authoritative complete monthly snapshot could be established.",
+    )
+    blocker_codes = {item["code"] for item in export_readiness(db, task.id)["blockers"]}
+
+    assert "MONTHLY_COHORT_NOT_FULLY_APPROVED" in blocker_codes
+    assert "MONTHLY_COHORT_SIZE_INVALID" in blocker_codes
     db.close()
 
 

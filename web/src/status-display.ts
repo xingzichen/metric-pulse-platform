@@ -110,6 +110,7 @@ const reasonLabels: Record<string, string> = {
   VALIDATION_FAILED: "结果校验未通过",
   VALIDATED_COMPLETE: "结果完整且已通过校验",
   HUMAN_CORRECTION: "人工修正后通过",
+  HUMAN_CONFIRMED_AFTER_EXECUTION_FAILURE: "执行最终失败后人工确认无法解决",
   RECOLLECTION_REQUESTED: "已要求重新采集",
   NO_DIRECT_SOURCE: "未提供采集链接",
   DIRECT_FETCH_FAILED: "采集链接获取失败",
@@ -123,12 +124,15 @@ const reasonLabels: Record<string, string> = {
 
 const blockerLabels: Record<string, string> = {
   EXECUTION_INCOMPLETE: "执行尚未完成",
+  FAILED_NOT_HANDLED: "最终失败项尚未人工处理",
   RESOLVED_NOT_APPROVED: "已解决但尚未审核通过",
   UNRESOLVED_NOT_CONFIRMED: "未解决项尚未人工确认",
   INVALID: "存在无效结果",
   NOT_EVALUATED: "存在未评估结果",
   ANNUAL_COHORT_NOT_FULLY_APPROVED: "年度 Top 50 尚未全部形成正式结果",
   ANNUAL_COHORT_SIZE_INVALID: "年度 Top 50 批次数量不完整",
+  MONTHLY_COHORT_NOT_FULLY_APPROVED: "月度 Top 10 尚未全部形成正式结果",
+  MONTHLY_COHORT_SIZE_INVALID: "月度 Top 10 批次数量不完整",
 };
 
 export function getReasonLabel(value?: string | null) {

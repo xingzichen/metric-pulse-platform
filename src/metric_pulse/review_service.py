@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from .dataset_profiles import (
     AI_ALGORITHM_COLLECTION_PROFILE,
+    AI_ALGORITHM_COLLECTION_TOP_N,
     FORBES_AI50_SOURCE_URL,
     TOP_LIST_AI_COUNT,
     TOP_LIST_AI_PROFILE,
@@ -143,8 +144,10 @@ def _apply_review_conversion(
         if not 1800 <= establish_date <= rank_year:
             raise ValueError("成立时间必须是不晚于榜单年度的有效年份")
         deterministic = (unit.validation or {}).get("deterministic_profile_values") or {}
-        datasource_date = deterministic.get("datasource_date") or (unit.suggestion or {}).get(
-            "datasource_date"
+        datasource_date = (
+            deterministic.get("datasource_date")
+            or (unit.suggestion or {}).get("datasource_date")
+            or result.get("datasource_date")
         )
         if not datasource_date:
             raise ValueError("福布斯官方发布时间缺失, 不能提交年度批次修正")
@@ -245,30 +248,44 @@ def review_unit(
 ) -> CollectionUnit:
     """应用一项人工决策并追加不可变 ReviewDecision。
 
-    APPROVED 接受建议；CORRECTED 要求提交全部目标字段；REJECTED 把执行单元重新置为待采集；
-    CONFIRMED_UNRESOLVED 必须附调查说明。``commit=False`` 仅供批量审核在外层统一提交。
+    APPROVED 只接受成功执行的建议；CORRECTED 可对成功或最终失败单元提交全部目标字段；
+    REJECTED 把执行单元重新置为待采集；CONFIRMED_UNRESOLVED 必须附调查说明。最终失败单元
+    的执行状态始终保留，人工结论只改变解决与审核状态。``commit=False`` 仅供批量审核在外层
+    统一提交。
     """
 
     if unit.version != expected_version:
         raise ReviewConflict("Review version conflict")
-    if unit.status != UnitStatus.SUCCEEDED:
-        raise ValueError("Only succeeded units can be reviewed")
+    if unit.status not in {UnitStatus.SUCCEEDED, UnitStatus.FAILED_FINAL}:
+        raise ValueError("Only succeeded or final-failed units can be reviewed")
+    execution_status_before = unit.status
+    execution_error_before = unit.error
+    execution_failed = unit.status == UnitStatus.FAILED_FINAL
     before = unit.final_values
     if decision == ReviewStatus.APPROVED:
+        if execution_failed:
+            raise ValueError("Final-failed units have no machine suggestion to approve")
         if unit.resolution_status != ResolutionStatus.RESOLVED:
             raise ValueError("Only resolved units can be approved")
         final_values = _complete_review_source_url(db, unit, unit.suggestion or {})
     elif decision == ReviewStatus.CORRECTED:
         if values is None or set(values) != set(unit.target_fields):
             raise ValueError("Corrected values must contain every target field")
+        if execution_failed and (not comment or not comment.strip()):
+            raise ValueError("Correcting a final-failed unit requires an audit comment")
         final_values = _complete_review_source_url(db, unit, values)
         final_values, correction_validation = _apply_review_conversion(unit, final_values)
         status, reason, risk = classify_resolution(
-            execution_status=unit.status,
+            # 人工补录形成独立的业务结果，但不得覆盖真实的 FAILED_FINAL 执行状态。
+            execution_status=UnitStatus.SUCCEEDED if execution_failed else unit.status,
             target_fields=list(unit.target_fields),
             values=final_values,
             validation=correction_validation,
         )
+        if execution_failed and status != ResolutionStatus.RESOLVED:
+            raise ValueError(
+                "A final-failed unit must be fully completed, or confirmed unresolved instead"
+            )
         unit.resolution_status = status
         unit.resolution_reason = "HUMAN_CORRECTION" if status == ResolutionStatus.RESOLVED else reason
         unit.risk_level = risk
@@ -283,7 +300,7 @@ def review_unit(
         unit.suggestion = None
         unit.error = None
     elif decision == ReviewStatus.CONFIRMED_UNRESOLVED:
-        if unit.resolution_status not in {
+        if not execution_failed and unit.resolution_status not in {
             ResolutionStatus.PARTIAL,
             ResolutionStatus.UNRESOLVED,
             ResolutionStatus.CONFLICT,
@@ -291,8 +308,15 @@ def review_unit(
             raise ValueError("Only partial, unresolved, or conflicting units can be confirmed unresolved")
         if not comment or not comment.strip():
             raise ValueError("Confirmed unresolved requires an investigation comment")
-        final_values = unit.suggestion or {}
+        if execution_failed:
+            unit.resolution_status = ResolutionStatus.UNRESOLVED
+            unit.resolution_reason = "HUMAN_CONFIRMED_AFTER_EXECUTION_FAILURE"
+            final_values = {}
+        else:
+            final_values = unit.suggestion or {}
     elif decision == ReviewStatus.SKIPPED:
+        if execution_failed:
+            raise ValueError("Final-failed units cannot be skipped")
         if unit.record.row_contract.get("optional") is not True:
             raise ValueError("Skipped is only allowed for explicitly optional units")
         final_values = None
@@ -315,7 +339,11 @@ def review_unit(
             comment=comment,
             unit_version=unit.version,
             policy_id=unit.review_policy_id,
-            metadata_json={"sampled": unit.review_sampled},
+            metadata_json={
+                "sampled": unit.review_sampled,
+                "execution_status_before": execution_status_before,
+                "execution_error_before": execution_error_before,
+            },
         )
     )
     record_sample_outcome(
@@ -369,13 +397,27 @@ def export_readiness(db: Session, task_id: str) -> dict[str, Any]:
         ResolutionStatus.CONFLICT,
     }
     annual_profile_units = 0
+    monthly_profile_units = 0
     for unit in units:
         annual_profile = unit.record.row_contract.get("profile") == TOP_LIST_AI_PROFILE
+        monthly_profile = (
+            unit.record.row_contract.get("profile") == AI_ALGORITHM_COLLECTION_PROFILE
+        )
         if annual_profile:
             annual_profile_units += 1
+        if monthly_profile:
+            monthly_profile_units += 1
         counts[unit.review_status] = counts.get(unit.review_status, 0) + 1
         blocker: str | None = None
-        if unit.status != UnitStatus.SUCCEEDED:
+        if unit.status == UnitStatus.FAILED_FINAL:
+            if (
+                unit.review_status == ReviewStatus.CORRECTED
+                and unit.resolution_status == ResolutionStatus.RESOLVED
+            ) or unit.review_status == ReviewStatus.CONFIRMED_UNRESOLVED:
+                blocker = None
+            else:
+                blocker = "FAILED_NOT_HANDLED"
+        elif unit.status != UnitStatus.SUCCEEDED:
             blocker = "EXECUTION_INCOMPLETE"
         elif unit.resolution_status == ResolutionStatus.RESOLVED:
             if unit.review_status not in approved:
@@ -393,11 +435,19 @@ def export_readiness(db: Session, task_id: str) -> dict[str, Any]:
         # 普通表导出，但不能生成一份少公司的“Top 50”。
         if annual_profile and unit.review_status not in approved:
             blocker = "ANNUAL_COHORT_NOT_FULLY_APPROVED"
+        # 月度 Top 10 同样是原子快照；确认未解决可以关闭人工调查，但不能把九条结果导出成
+        # 一份看似完整的榜单。人工补录形成 CORRECTED + RESOLVED 后仍属于正式值。
+        if monthly_profile and unit.review_status not in approved:
+            blocker = "MONTHLY_COHORT_NOT_FULLY_APPROVED"
         if blocker:
             blocker_counts[blocker] = blocker_counts.get(blocker, 0) + 1
     if annual_profile_units and annual_profile_units != TOP_LIST_AI_COUNT:
         blocker_counts["ANNUAL_COHORT_SIZE_INVALID"] = abs(
             TOP_LIST_AI_COUNT - annual_profile_units
+        ) or 1
+    if monthly_profile_units and monthly_profile_units != AI_ALGORITHM_COLLECTION_TOP_N:
+        blocker_counts["MONTHLY_COHORT_SIZE_INVALID"] = abs(
+            AI_ALGORITHM_COLLECTION_TOP_N - monthly_profile_units
         ) or 1
     blockers = [{"code": code, "count": count} for code, count in sorted(blocker_counts.items())]
     return {

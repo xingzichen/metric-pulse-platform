@@ -102,7 +102,7 @@ async function control(action: string) {
           v-for="action in query.data.value.allowedActions"
           :key="action"
           :type="
-            action === 'start' || action === 'resume'
+            action === 'start' || action === 'resume' || action === 'retry'
               ? 'primary'
               : action === 'stop'
                 ? 'warning'
@@ -114,6 +114,7 @@ async function control(action: string) {
               {
                 start: "开始",
                 resume: "恢复",
+                retry: "重试失败项",
                 pause: "暂停",
                 stop: "停止",
                 delete: "删除",

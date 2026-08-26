@@ -30,7 +30,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from sqlalchemy import desc, func, select
+from sqlalchemy import case, desc, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -40,6 +40,7 @@ from .dataset_profiles import excluded_sheet_policy, has_locked_dataset_profile
 from .db import SessionLocal, create_schema, get_session
 from .models import (
     AuditLog,
+    CollectionAttempt,
     CollectionTask,
     CollectionUnit,
     Evidence,
@@ -591,7 +592,7 @@ async def start(
         raise HTTPException(status_code=409, detail="Task version conflict")
     try:
         start_task(db, task, user)
-    except InvalidTransition as exc:
+    except (InvalidTransition, ValueError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if settings.eager_tasks:
         background.add_task(process_task_sync, task.id)
@@ -665,12 +666,18 @@ def delete_task(
 async def retry_failed(
     task_id: str,
     background: BackgroundTasks,
+    payload: TaskControl | None = None,
     db: Session = Depends(get_session),
     user: User = Depends(require_role(Role.OPERATOR)),
 ) -> dict[str, Any]:
     await require_collection_provider_ready()
     task = require_task(db, task_id)
-    start_task(db, task, user)
+    if payload and payload.expected_version is not None and payload.expected_version != task.version:
+        raise HTTPException(status_code=409, detail="Task version conflict")
+    try:
+        start_task(db, task, user)
+    except (InvalidTransition, ValueError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     if settings.eager_tasks:
         background.add_task(process_task_sync, task.id)
     else:
@@ -685,6 +692,7 @@ def review_queue(
     task_id: str,
     review_status: str | None = Query(default=None, alias="reviewStatus"),
     resolution_status: str | None = Query(default=None, alias="resolutionStatus"),
+    execution_status: str | None = Query(default=None, alias="executionStatus"),
     offset: int = 0,
     limit: int = Query(default=50, le=200),
     db: Session = Depends(get_session),
@@ -693,15 +701,29 @@ def review_queue(
     require_task(db, task_id)
     query = select(CollectionUnit).where(
         CollectionUnit.task_id == task_id,
-        CollectionUnit.status == UnitStatus.SUCCEEDED,
+        CollectionUnit.status.in_([UnitStatus.SUCCEEDED, UnitStatus.FAILED_FINAL]),
     )
     if review_status:
         query = query.where(CollectionUnit.review_status == review_status)
+    else:
+        # 无历史状态筛选时返回真正待人工处理的行动队列；已完成项仍可通过显式状态查看。
+        query = query.where(CollectionUnit.review_required.is_(True))
     if resolution_status:
         query = query.where(CollectionUnit.resolution_status == resolution_status)
+    if execution_status:
+        if execution_status not in {UnitStatus.SUCCEEDED, UnitStatus.FAILED_FINAL}:
+            raise HTTPException(status_code=422, detail="Unsupported review execution status")
+        query = query.where(CollectionUnit.status == execution_status)
     total = db.scalar(select(func.count()).select_from(query.subquery())) or 0
-    units = db.scalars(query.order_by(CollectionUnit.id).offset(offset).limit(limit)).all()
-    return {"items": [unit_view(unit) for unit in units], "total": total}
+    units = db.scalars(
+        query.order_by(
+            case((CollectionUnit.status == UnitStatus.FAILED_FINAL, 0), else_=1),
+            CollectionUnit.id,
+        )
+        .offset(offset)
+        .limit(limit)
+    ).all()
+    return {"items": [unit_view(unit, detail=True) for unit in units], "total": total}
 
 
 @app.get("/api/v1/review-units/{unit_id}")
@@ -718,6 +740,11 @@ def review_context(
         select(SourceAcquisitionAttempt)
         .where(SourceAcquisitionAttempt.unit_id == unit.id)
         .order_by(desc(SourceAcquisitionAttempt.started_at))
+    ).all()
+    attempts = db.scalars(
+        select(CollectionAttempt)
+        .where(CollectionAttempt.unit_id == unit.id)
+        .order_by(desc(CollectionAttempt.started_at))
     ).all()
     history = db.scalars(
         select(ReviewDecision)
@@ -757,6 +784,20 @@ def review_context(
             }
             for item in acquisitions
         ],
+        "collectionAttempts": [
+            {
+                "id": item.id,
+                "step": item.step,
+                "status": item.status,
+                "inputSummary": item.input_summary,
+                "outputSummary": item.output_summary,
+                "model": item.model,
+                "error": item.error,
+                "startedAt": item.started_at,
+                "endedAt": item.ended_at,
+            }
+            for item in attempts
+        ],
         "history": [
             {
                 "id": item.id,
@@ -764,6 +805,7 @@ def review_context(
                 "beforeValues": item.before_values,
                 "afterValues": item.after_values,
                 "comment": item.comment,
+                "metadata": item.metadata_json,
                 "createdAt": item.created_at,
             }
             for item in history

@@ -19,14 +19,19 @@ import { getReasonLabel, getStatusPresentation } from "../../../status-display";
 const id = String(useRoute<"/tasks/[taskId]/review">().params.taskId);
 const qc = useQueryClient();
 const filter = ref("UNREVIEWED");
+const executionFilter = ref("ALL");
 const page = ref(1);
 const selected = ref("");
 const queue = useQuery({
-  queryKey: ["review-queue", id, filter, page],
+  queryKey: ["review-queue", id, filter, executionFilter, page],
   queryFn: () =>
     api<{ items: Unit[]; total: number }>(
-      `/api/v1/tasks/${id}/review-queue?reviewStatus=${filter.value}&offset=${(page.value - 1) * 50}&limit=50`,
+      `/api/v1/tasks/${id}/review-queue?reviewStatus=${filter.value}${executionFilter.value === "ALL" ? "" : `&executionStatus=${executionFilter.value}`}&offset=${(page.value - 1) * 50}&limit=50`,
     ),
+});
+watch([filter, executionFilter], () => {
+  page.value = 1;
+  selectedIds.value = [];
 });
 watch(
   () => queue.data.value?.items,
@@ -94,6 +99,9 @@ const isAlgorithmCollection = computed(
 );
 const isForbesAi50 = computed(
   () => rowContract.value.profile === "top_list_ai_forbes_annual_v1",
+);
+const isExecutionFailure = computed(
+  () => context.data.value?.executionStatus === "FAILED_FINAL",
 );
 const algorithmApplicationFields = new Set([
   "logic_id",
@@ -192,12 +200,18 @@ const reviewFilterOptions = [
   "REJECTED",
   "SKIPPED",
 ];
+const executionFilterOptions = ["ALL", "FAILED_FINAL", "SUCCEEDED"];
+const executionFilterLabel = (value: string) =>
+  value === "ALL" ? "全部执行结果" : getStatusPresentation(value).label;
+const canBulkApprove = (unit: Unit) => unit.executionStatus === "SUCCEEDED";
 watch(
   () => context.data.value,
   (data) => {
     // 切换行时必须先清空 reactive 对象，否则上一行特有字段会混入本次修正。
     Object.keys(corrected).forEach((k) => delete corrected[k]);
-    Object.assign(corrected, data?.suggestion || {});
+    for (const field of data?.targetFields || []) corrected[field] = null;
+    Object.assign(corrected, data?.finalValues || data?.suggestion || {});
+    comment.value = "";
     if (
       data?.targetFields.includes("source_url") &&
       !corrected.source_url
@@ -219,6 +233,14 @@ watch(
 );
 async function decide(decision: string) {
   const u = context.data.value!;
+  if (
+    (decision === "CONFIRMED_UNRESOLVED" ||
+      (decision === "CORRECTED" && u.executionStatus === "FAILED_FINAL")) &&
+    !comment.value.trim()
+  ) {
+    ElMessage.warning("请填写人工调查或补录依据");
+    return;
+  }
   try {
     await post(`/api/v1/review-units/${u.id}`, {
       decision,
@@ -272,6 +294,7 @@ function shortcut(event: KeyboardEvent) {
     r: "REJECTED",
     u: "CONFIRMED_UNRESOLVED",
   }[event.key.toLowerCase()];
+  if (action === "APPROVED" && isExecutionFailure.value) return;
   if (action) {
     event.preventDefault();
     void decide(action);
@@ -287,6 +310,13 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
       <h1>逐行核对</h1>
       <div class="muted">左侧原始与过程数据，右侧采集建议、来源证据和最终值</div>
     </div>
+    <el-select v-model="executionFilter" style="width: 170px"
+      ><el-option
+        v-for="x in executionFilterOptions"
+        :key="x"
+        :label="executionFilterLabel(x)"
+        :value="x"
+    /></el-select>
     <el-select v-model="filter" style="width: 180px"
       ><el-option
         v-for="x in reviewFilterOptions"
@@ -314,12 +344,16 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
           (rows: Unit[]) => (selectedIds = rows.map((row) => row.id))
         "
         height="650"
-        ><el-table-column type="selection" width="44" />
+        ><el-table-column type="selection" width="44" :selectable="canBulkApprove" />
         <el-table-column label="行"
           ><template #default="s">{{
             s.row.record?.sourceRow || s.row.id.slice(0, 6)
           }}</template></el-table-column
-        ><el-table-column label="状态"
+        ><el-table-column label="执行"
+          ><template #default="s"
+            ><StatusTag
+              :value="s.row.executionStatus" /></template></el-table-column
+        ><el-table-column label="审核"
           ><template #default="s"
             ><StatusTag
               :value="s.row.reviewStatus" /></template></el-table-column
@@ -441,6 +475,15 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
         ></el-card
         ><el-card class="card" style="margin-top: 16px"
         ><template #header><b>建议值与证据</b></template
+        ><el-alert
+          v-if="isExecutionFailure"
+          title="该条目抓取最终失败，必须人工处置"
+          :description="`失败原因：${context.data.value.error || '未记录'}。请完整填写目标字段并保存人工补录，或填写调查说明后确认无法解决；不能直接批准。`"
+          type="error"
+          :closable="false"
+          show-icon
+          style="margin-bottom: 16px"
+        />
         ><div
           v-if="context.data.value.acquisitionAttempts?.length"
           class="acquisition-route"
@@ -587,7 +630,9 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
             ><el-input
               v-if="
                 (isAlgorithmCollection && algorithmApplicationFields.has(field)) ||
-                (isForbesAi50 && forbesApplicationFields.has(field))
+                (isForbesAi50 &&
+                  forbesApplicationFields.has(field) &&
+                  !(isExecutionFailure && field === 'datasource_date'))
               "
               :model-value="corrected[field]"
               disabled
@@ -630,23 +675,39 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
               }}</a>
               <p>{{ e.excerpt }}</p>
             </div></el-collapse-item
-          ></el-collapse
+          ><el-collapse-item
+            :title="`采集尝试（${context.data.value.collectionAttempts?.length || 0}）`"
+          >
+            <el-timeline>
+              <el-timeline-item
+                v-for="attempt in context.data.value.collectionAttempts"
+                :key="attempt.id"
+                :timestamp="attempt.startedAt"
+                placement="top"
+              >
+                <b>{{ attempt.step }}</b>
+                <StatusTag :value="attempt.status" />
+                <p v-if="attempt.error" class="attempt-error">{{ attempt.error }}</p>
+                <pre v-if="Object.keys(attempt.outputSummary || {}).length">{{ JSON.stringify(attempt.outputSummary, null, 2) }}</pre>
+              </el-timeline-item>
+            </el-timeline>
+          </el-collapse-item></el-collapse
         >
         <div class="actions" style="margin-top: 18px">
           <el-input
             v-model="comment"
             type="textarea"
             :rows="2"
-            placeholder="修正、驳回或确认未解决时填写调查说明"
+            :placeholder="isExecutionFailure ? '必填：说明人工补录来源，或记录确认无法解决的调查过程' : '修正、驳回或确认未解决时填写调查说明'"
             style="margin-bottom: 12px"
           />
-          <el-button type="success" @click="decide('APPROVED')"
+          <el-button v-if="!isExecutionFailure" type="success" @click="decide('APPROVED')"
             >确认建议（A）</el-button
           ><el-button type="primary" @click="decide('CORRECTED')"
             >保存修正（C）</el-button
           ><el-button
             v-if="
-              ['PARTIAL', 'UNRESOLVED', 'CONFLICT'].includes(
+              isExecutionFailure || ['PARTIAL', 'UNRESOLVED', 'CONFLICT'].includes(
                 context.data.value.resolutionStatus,
               )
             "
@@ -727,5 +788,9 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
   border: 1px solid #e2e8f0;
   border-radius: 8px;
   background: #fff;
+}
+.attempt-error {
+  color: #b91c1c;
+  white-space: pre-wrap;
 }
 </style>

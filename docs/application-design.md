@@ -608,7 +608,7 @@ sequenceDiagram
 
 ### 13.2 行队列
 
-队列只接收已执行且需人工决策的项；`PENDING/LEASED/RUNNING/DISCARDED` 不得进入，`AUTO_APPROVED` 只进入抽样队列。默认排序：
+队列只接收已执行且需人工决策的项；`SUCCEEDED` 和重试耗尽的 `FAILED_FINAL` 可进入，`PENDING/LEASED/RUNNING/FAILED_RETRYABLE/DISCARDED` 不得进入，`AUTO_APPROVED` 只进入抽样队列。`FAILED_FINAL` 必须展示最终错误和完整 attempt 时间线，并只允许人工完整补录、确认无法解决或驳回重采。默认排序：
 
 1. 失败；
 2. 来源冲突；
@@ -756,7 +756,7 @@ POST /api/v1/reviews/bulk/apply
 8. 标记相关正式导出为 `STALE`；
 9. 写入 task event 和 audit log。
 
-单条决定还支持 `CONFIRMED_UNRESOLVED`，要求非空原因码、调查摘要和已使用证据引用，不允许字段覆盖伪造业务值。`AUTO_APPROVED` 只由后端 ReviewPolicy 引擎产生，普通审核用户不能手工选择该决定。
+单条决定还支持 `CONFIRMED_UNRESOLVED`，要求非空原因码、调查摘要和已使用证据引用，不允许字段覆盖伪造业务值。`FAILED_FINAL` 不允许 `APPROVED`；`CORRECTED` 必须提交全部目标字段和非空审计说明并重新通过业务校验，`CONFIRMED_UNRESOLVED` 必须把解决状态置为 `UNRESOLVED`，二者均保留执行失败状态。任务整体重试不得覆盖这两种人工完成态；只有未处理或已驳回项进入新运行。Top 10/Top 50 原子批次的确认未解决仍阻塞正式批次导出。`AUTO_APPROVED` 只由后端 ReviewPolicy 引擎产生，普通审核用户不能手工选择该决定。
 
 ### 14.1 批量审核
 

@@ -48,6 +48,7 @@ P0-3 状态语义
 
 - 版本化 `ReviewPolicy` 只能对低风险且经确定性闭环验证的结果产生 `AUTO_APPROVED`，并按政策抽样。
 - 人工队列默认只显示异常、冲突、低置信、抽样和需要业务决断的结果。
+- 重试耗尽的 `FAILED_FINAL` 是已执行异常，优先进入人工队列并展示最终错误与完整 attempt；只能完整补录、确认无法解决或驳回重采，禁止直接批准。
 - 批量操作分为 filter snapshot preview 和 expected-version apply；冲突、无效、未执行或在途结果不得批量通过。
 - `CONFIRMED_UNRESOLVED` 允许经调查确认无法安全填值的项保持空值，但必须进入正式导出附带的未解决报告。
 

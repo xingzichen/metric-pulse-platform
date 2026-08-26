@@ -55,6 +55,9 @@ def sheet_view(sheet: WorkbookSheet) -> dict[str, Any]:
 def task_view(task: CollectionTask, *, detail: bool = False) -> dict[str, Any]:
     """序列化任务统计、运行版本、控制版本及当前可用操作。"""
 
+    actions = allowed_actions(task.status)
+    if task.stats.get("retryable") == 0 and "retry" in actions:
+        actions.remove("retry")
     result = {
         "id": task.id,
         "name": task.name,
@@ -63,7 +66,7 @@ def task_view(task: CollectionTask, *, detail: bool = False) -> dict[str, Any]:
         "version": task.version,
         "runVersion": task.run_version,
         "stats": task.stats,
-        "allowedActions": allowed_actions(task.status),
+        "allowedActions": actions,
         "createdAt": task.created_at,
         "updatedAt": task.updated_at,
     }
