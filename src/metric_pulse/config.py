@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 
@@ -50,6 +51,7 @@ class Settings(BaseSettings):
     omlx_api_key: str = ""
     omlx_timeout_seconds: float = 900
     omlx_max_output_tokens: int = 4096
+    omlx_json_retry_attempts: int = Field(default=1, ge=0, le=2)
     sheet_analysis_max_output_tokens: int = 2048
     synthesize_max_output_tokens: int = 4096
     verify_max_output_tokens: int = 4096
@@ -97,11 +99,22 @@ class Settings(BaseSettings):
         return value
 
     def ensure_directories(self) -> None:
-        """在应用初始化时创建所有本地持久化目录。"""
+        """创建持久化目录，并用真实文件探针拒绝只读或属主错误的挂载卷。"""
 
-        self.object_root.mkdir(parents=True, exist_ok=True)
-        self.export_root.mkdir(parents=True, exist_ok=True)
-        self.source_cache_root.mkdir(parents=True, exist_ok=True)
+        for label, path in (
+            ("object storage", self.object_root),
+            ("export storage", self.export_root),
+            ("source cache", self.source_cache_root),
+        ):
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                with tempfile.NamedTemporaryFile(
+                    dir=path,
+                    prefix=".metric-pulse-write-probe-",
+                ):
+                    pass
+            except OSError as exc:
+                raise RuntimeError(f"{label} directory is not writable: {path}: {exc}") from exc
         self.omlx_lock_path.parent.mkdir(parents=True, exist_ok=True)
         if self.database_url.startswith("sqlite:///"):
             Path(self.database_url.removeprefix("sqlite:///")).parent.mkdir(

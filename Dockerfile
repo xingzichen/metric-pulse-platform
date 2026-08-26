@@ -14,7 +14,9 @@ COPY src ./src
 COPY alembic.ini ./
 COPY migrations ./migrations
 RUN uv sync --frozen --no-dev
-RUN useradd --create-home --uid 10001 metric && mkdir -p /data/objects /data/exports && chown -R metric:metric /app /data
+RUN useradd --create-home --uid 10001 metric \
+    && mkdir -p /data/objects /data/exports /data/source-cache \
+    && chown -R metric:metric /app /data
 USER metric
 EXPOSE 8000
 CMD ["metric-pulse-api"]

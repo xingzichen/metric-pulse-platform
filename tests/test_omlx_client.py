@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 
 import httpx
+import pytest
 
 from metric_pulse.config import Settings
-from metric_pulse.omlx import OMLXClient
+from metric_pulse.omlx import OMLXClient, OMLXError
 
 
 def test_generate_json_uses_qwen_compatible_parameters(monkeypatch) -> None:
@@ -74,6 +75,8 @@ def test_generate_json_uses_qwen_compatible_parameters(monkeypatch) -> None:
         "cache_hit": True,
         "response_id": "response-1",
         "finish_reason": "stop",
+        "protocol_attempt": 1,
+        "protocol_retries": 0,
     }
 
 
@@ -118,3 +121,79 @@ def test_generate_json_is_globally_serialized(monkeypatch, tmp_path) -> None:
 
     asyncio.run(run_calls())
     assert maximum == 1
+
+
+def test_generate_json_retries_empty_protocol_response_once(monkeypatch) -> None:
+    responses = ["", '{"values":{"answer":42}}']
+
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "id": "response-retry",
+                "choices": [
+                    {
+                        "message": {"content": responses.pop(0)},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def post(self, _url, *, headers, json):
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    client = OMLXClient(Settings(vision_analysis_enabled=False, omlx_json_retry_attempts=1))
+
+    result = asyncio.run(client.generate_json(system="json", prompt="value"))
+
+    assert result == {"values": {"answer": 42}}
+    assert responses == []
+    assert client.last_response_metadata["protocol_attempt"] == 2
+    assert client.last_response_metadata["protocol_retries"] == 1
+
+
+def test_generate_json_reports_safe_diagnostics_after_empty_retries(monkeypatch) -> None:
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "id": "response-empty",
+                "choices": [{"message": {"content": ""}, "finish_reason": "stop"}],
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def post(self, _url, *, headers, json):
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    client = OMLXClient(Settings(vision_analysis_enabled=False, omlx_json_retry_attempts=1))
+
+    with pytest.raises(OMLXError, match=r"attempt=2/2.*content_length=0"):
+        asyncio.run(client.generate_json(system="json", prompt="value"))
+
+    assert client.last_response_metadata["protocol_error"] == "JSONDecodeError"
+    assert client.last_response_metadata["content_length"] == 0

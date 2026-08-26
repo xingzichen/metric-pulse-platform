@@ -1478,7 +1478,10 @@ class OMLXCollector:
         )
         if isinstance(self.client, OMLXClient):
             synthesize_request["max_output_tokens"] = settings.synthesize_max_output_tokens
-        response = await self.client.generate_json(**synthesize_request)
+        try:
+            response = await self.client.generate_json(**synthesize_request)
+        except OMLXError as exc:
+            raise OMLXError(f"SYNTHESIZE failed: {exc}") from exc
         synthesize_telemetry = self._model_telemetry()
         synthesize_ended_at = datetime.now(UTC)
         # 第三阶段：第二次调用拿到相同证据及第一次候选，以独立审计者身份逐字段复核。
@@ -1539,7 +1542,10 @@ class OMLXCollector:
         )
         if isinstance(self.client, OMLXClient):
             verify_request["max_output_tokens"] = settings.verify_max_output_tokens
-        verification = await self.client.generate_json(**verify_request)
+        try:
+            verification = await self.client.generate_json(**verify_request)
+        except OMLXError as exc:
+            raise OMLXError(f"VERIFY failed: {exc}") from exc
         verify_telemetry = self._model_telemetry()
         verify_ended_at = datetime.now(UTC)
         contract_valid, unmatched_constraints = required_contract_matches(

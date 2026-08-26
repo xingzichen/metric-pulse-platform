@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import fcntl
+import hashlib
 import json
 import re
 from contextlib import asynccontextmanager
@@ -129,47 +130,96 @@ class OMLXClient:
         }
         # 当前部署使用 response_format=json_object 时偶尔会把输入值回显成数组，所以文本和
         # 视觉请求统一使用提示词约束 JSON，再在提供方边界严格校验顶层对象。
-        try:
-            async with (
-                single_model_channel(self.settings.omlx_lock_path),
-                httpx.AsyncClient(timeout=self.settings.omlx_timeout_seconds) as client,
-            ):
-                response = await client.post(self.endpoint, headers=self._headers(), json=payload)
-                response.raise_for_status()
-            response_payload = response.json()
-            usage = response_payload.get("usage", {})
-            prompt_details = usage.get("prompt_tokens_details", {}) if isinstance(usage, dict) else {}
-            cached_tokens = prompt_details.get("cached_tokens") if isinstance(prompt_details, dict) else None
-            self.last_response_metadata = {
-                "usage": usage if isinstance(usage, dict) else {},
-                "cached_prompt_tokens": cached_tokens,
-                "cache_hit": isinstance(cached_tokens, int) and cached_tokens > 0,
-                "response_id": response_payload.get("id"),
-            }
-            content = response_payload["choices"][0]["message"]["content"]
-            finish_reason = response_payload["choices"][0].get("finish_reason")
-            self.last_response_metadata["finish_reason"] = finish_reason
-            if not isinstance(content, str):
-                raise OMLXError("OMLX returned non-text structured content")
-            parsed = json.loads(JSON_FENCE.sub("", content).strip())
-            # 兼容本地多模态模板的两种无害包装：单元素数组和“字符串中的 JSON”。最多展开
-            # 两层，避免递归解析任意模型输出；展开后仍必须是对象。
-            for _ in range(2):
-                if isinstance(parsed, list) and len(parsed) == 1:
-                    parsed = parsed[0]
-                    continue
-                if isinstance(parsed, str) and parsed.lstrip().startswith(("{", "[")):
-                    parsed = json.loads(parsed)
-                    continue
-                break
-            if not isinstance(parsed, dict):
-                length = len(parsed) if isinstance(parsed, list | str) else None
-                raise OMLXError(
-                    f"OMLX JSON response must be an object (type={type(parsed).__name__}, length={length})"
-                )
-            return parsed
-        except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError) as exc:
-            raise OMLXError(str(exc)) from exc
+        maximum_attempts = self.settings.omlx_json_retry_attempts + 1
+        async with (
+            single_model_channel(self.settings.omlx_lock_path),
+            httpx.AsyncClient(timeout=self.settings.omlx_timeout_seconds) as client,
+        ):
+            for attempt in range(1, maximum_attempts + 1):
+                content: object = None
+                response_id: object = None
+                finish_reason: object = None
+                self.last_response_metadata = {
+                    "protocol_attempt": attempt,
+                    "protocol_retries": attempt - 1,
+                }
+                try:
+                    response = await client.post(self.endpoint, headers=self._headers(), json=payload)
+                    response.raise_for_status()
+                    response_payload = response.json()
+                    if not isinstance(response_payload, dict):
+                        raise TypeError(
+                            "HTTP response JSON must be an object "
+                            f"({type(response_payload).__name__})"
+                        )
+                    usage = response_payload.get("usage", {})
+                    prompt_details = (
+                        usage.get("prompt_tokens_details", {}) if isinstance(usage, dict) else {}
+                    )
+                    cached_tokens = (
+                        prompt_details.get("cached_tokens")
+                        if isinstance(prompt_details, dict)
+                        else None
+                    )
+                    response_id = response_payload.get("id")
+                    content = response_payload["choices"][0]["message"]["content"]
+                    finish_reason = response_payload["choices"][0].get("finish_reason")
+                    self.last_response_metadata = {
+                        "usage": usage if isinstance(usage, dict) else {},
+                        "cached_prompt_tokens": cached_tokens,
+                        "cache_hit": isinstance(cached_tokens, int) and cached_tokens > 0,
+                        "response_id": response_id,
+                        "finish_reason": finish_reason,
+                        "protocol_attempt": attempt,
+                        "protocol_retries": attempt - 1,
+                    }
+                    if not isinstance(content, str):
+                        raise TypeError(
+                            f"non-text structured content ({type(content).__name__})"
+                        )
+                    normalized_content = JSON_FENCE.sub("", content).strip()
+                    parsed = json.loads(normalized_content)
+                    # 兼容本地多模态模板的两种无害包装：单元素数组和“字符串中的 JSON”。最多展开
+                    # 两层，避免递归解析任意模型输出；展开后仍必须是对象。
+                    for _ in range(2):
+                        if isinstance(parsed, list) and len(parsed) == 1:
+                            parsed = parsed[0]
+                            continue
+                        if isinstance(parsed, str) and parsed.lstrip().startswith(("{", "[")):
+                            parsed = json.loads(parsed)
+                            continue
+                        break
+                    if not isinstance(parsed, dict):
+                        length = len(parsed) if isinstance(parsed, list | str) else None
+                        raise TypeError(
+                            "JSON response must be an object "
+                            f"(type={type(parsed).__name__}, length={length})"
+                        )
+                    return parsed
+                except httpx.HTTPError as exc:
+                    raise OMLXError(f"OMLX HTTP request failed: {exc}") from exc
+                except (AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
+                    content_text = content if isinstance(content, str) else ""
+                    content_hash = hashlib.sha256(content_text.encode()).hexdigest()[:16]
+                    diagnostic = (
+                        f"attempt={attempt}/{maximum_attempts}, response_id={response_id!r}, "
+                        f"finish_reason={finish_reason!r}, content_length={len(content_text)}, "
+                        f"content_sha256={content_hash}"
+                    )
+                    self.last_response_metadata.update(
+                        {
+                            "protocol_attempt": attempt,
+                            "protocol_retries": attempt - 1,
+                            "protocol_error": type(exc).__name__,
+                            "content_length": len(content_text),
+                            "content_sha256": content_hash,
+                        }
+                    )
+                    if attempt < maximum_attempts:
+                        continue
+                    raise OMLXError(
+                        f"OMLX returned invalid JSON/protocol content ({diagnostic}): {exc}"
+                    ) from exc
 
     async def analyze_sheet(
         self,

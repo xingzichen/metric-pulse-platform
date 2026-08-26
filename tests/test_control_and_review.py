@@ -573,6 +573,28 @@ def test_successful_retry_clears_previous_error(client) -> None:
     db.close()
 
 
+def test_permission_error_pauses_task_without_exhausting_unit_retries(client) -> None:
+    class PermissionFailingCollector:
+        async def collect(self, _record, _unit):
+            raise PermissionError(13, "Permission denied", "/data/source-cache/locks")
+
+    db, _, task, unit = _task_with_unit(
+        task_status=TaskStatus.QUEUED,
+        unit_status=UnitStatus.PENDING,
+    )
+
+    asyncio.run(TaskProcessor(PermissionFailingCollector()).process(db, task.id, max_units=1))
+
+    db.refresh(task)
+    db.refresh(unit)
+    assert task.status == TaskStatus.PAUSED
+    assert unit.status == UnitStatus.FAILED_RETRYABLE
+    assert unit.attempt_count == 1
+    assert unit.next_attempt_at is not None
+    assert "/data/source-cache/locks" in unit.error
+    db.close()
+
+
 def test_refresh_stats_includes_unflushed_unit_transition(client) -> None:
     db, _, task, unit = _task_with_unit(
         task_status=TaskStatus.RUNNING,

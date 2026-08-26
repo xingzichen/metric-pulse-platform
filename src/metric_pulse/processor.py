@@ -361,8 +361,11 @@ class TaskProcessor:
                 attempt.ended_at = datetime.now(UTC)
             except Exception as exc:  # worker 边界统一记录并隔离提供方、解析和持久化异常
                 unit.error = str(exc)
+                infrastructure_failure = isinstance(exc, PermissionError)
                 unit.status = (
-                    UnitStatus.FAILED_RETRYABLE if unit.attempt_count < 3 else UnitStatus.FAILED_FINAL
+                    UnitStatus.FAILED_RETRYABLE
+                    if infrastructure_failure or unit.attempt_count < 3
+                    else UnitStatus.FAILED_FINAL
                 )
                 attempt.status = "FAILED"
                 attempt.error = str(exc)
@@ -373,6 +376,19 @@ class TaskProcessor:
                     if isinstance(exc, SourceCooldownError):
                         delay = max(delay, exc.retry_after_seconds)
                     unit.next_attempt_at = datetime.now(UTC) + timedelta(seconds=delay)
+                if infrastructure_failure:
+                    task.status = TaskStatus.PAUSED
+                    task.version += 1
+                    add_event(
+                        db,
+                        task.id,
+                        "task.infrastructure.paused",
+                        {
+                            "errorType": type(exc).__name__,
+                            "message": str(exc),
+                            "unitId": unit.id,
+                        },
+                    )
             # 无论成功或失败都释放租约并在同一事务刷新统计，前端不会长期显示幽灵运行单元。
             unit.lease_owner = None
             unit.leased_until = None

@@ -1,8 +1,8 @@
 name: metric-pulse
 
 # 生产编排只拉取已经发布的镜像，不在服务器上重复构建源代码。
-# MP_IMAGE_TAG 默认固定为正式版本 1.0.3；升级或回滚时可临时指定其他不可变版本。
-x-app-image: &app-image ghcr.io/xingzichen/metric-pulse-platform-api:${MP_IMAGE_TAG:-1.0.3}
+# MP_IMAGE_TAG 默认固定为正式版本 1.0.4；升级或回滚时可临时指定其他不可变版本。
+x-app-image: &app-image ghcr.io/xingzichen/metric-pulse-platform-api:${MP_IMAGE_TAG:-1.0.4}
 
 services:
   postgres:
@@ -53,6 +53,7 @@ services:
       MP_OMLX_API_KEY: ${MP_OMLX_API_KEY:-}
       MP_OMLX_TIMEOUT_SECONDS: ${MP_OMLX_TIMEOUT_SECONDS:-900}
       MP_OMLX_MAX_OUTPUT_TOKENS: ${MP_OMLX_MAX_OUTPUT_TOKENS:-4096}
+      MP_OMLX_JSON_RETRY_ATTEMPTS: ${MP_OMLX_JSON_RETRY_ATTEMPTS:-1}
       MP_SHEET_ANALYSIS_MAX_OUTPUT_TOKENS: ${MP_SHEET_ANALYSIS_MAX_OUTPUT_TOKENS:-2048}
       MP_SYNTHESIZE_MAX_OUTPUT_TOKENS: ${MP_SYNTHESIZE_MAX_OUTPUT_TOKENS:-4096}
       MP_VERIFY_MAX_OUTPUT_TOKENS: ${MP_VERIFY_MAX_OUTPUT_TOKENS:-4096}
@@ -108,7 +109,7 @@ services:
       redis: { condition: service_healthy }
 
   web:
-    image: ghcr.io/xingzichen/metric-pulse-platform-web:${MP_IMAGE_TAG:-1.0.3}
+    image: ghcr.io/xingzichen/metric-pulse-platform-web:${MP_IMAGE_TAG:-1.0.4}
     restart: unless-stopped
     ports:
       - "${MP_WEB_PORT:-8080}:80"

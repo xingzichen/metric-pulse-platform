@@ -1,6 +1,6 @@
 # Metric Pulse Platform 生产部署与运维手册
 
-本文档说明如何使用已发布的 Docker 镜像，在 Linux 服务器或群晖 NAS 上部署、验证、升级、回滚和维护 Metric Pulse Platform。命令默认在项目部署目录执行，示例正式版本为 `1.0.3`。
+本文档说明如何使用已发布的 Docker 镜像，在 Linux 服务器或群晖 NAS 上部署、验证、升级、回滚和维护 Metric Pulse Platform。命令默认在项目部署目录执行，示例正式版本为 `1.0.4`。
 
 ## 1. 部署架构
 
@@ -81,7 +81,7 @@ cd /volume2/docker/metric-pulse-platform
 
 ```bash
 curl --fail --location --output compose.prod.yaml \
-  https://raw.githubusercontent.com/xingzichen/metric-pulse-platform/v1.0.3/compose.prod.yaml
+  https://raw.githubusercontent.com/xingzichen/metric-pulse-platform/v1.0.4/compose.prod.yaml
 ```
 
 也可以从仓库检出对应版本后复制 `compose.prod.yaml`。生产环境不需要源代码、Node.js 或 Python 开发环境。
@@ -92,7 +92,7 @@ curl --fail --location --output compose.prod.yaml \
 
 ```dotenv
 # 镜像版本与入口端口
-MP_IMAGE_TAG=1.0.3
+MP_IMAGE_TAG=1.0.4
 MP_WEB_PORT=56123
 
 # 数据库密码建议使用 openssl rand -hex 32 生成
@@ -108,6 +108,7 @@ MP_OMLX_MODEL=Qwen3.8-27B-6bit
 MP_OMLX_API_KEY=替换为OMLX密钥
 MP_OMLX_TIMEOUT_SECONDS=900
 MP_OMLX_MAX_OUTPUT_TOKENS=4096
+MP_OMLX_JSON_RETRY_ATTEMPTS=1
 MP_SHEET_ANALYSIS_MAX_OUTPUT_TOKENS=2048
 MP_SYNTHESIZE_MAX_OUTPUT_TOKENS=4096
 MP_VERIFY_MAX_OUTPUT_TOKENS=4096
@@ -156,6 +157,7 @@ docker compose --env-file .env -f compose.prod.yaml config --quiet
 - OMLX 的 128K 是输入与输出的总上下文上限，不要把所有阶段都直接调到 16K；视觉表格只有明确截断时才自动升档；
 - Worker 固定 `concurrency=1`，禁止增加 Celery 并发或启动多个 Worker 副本；
 - `source-cache-data` 卷必须同时挂载到 API、migrate 和 Worker，且纳入备份；删除该卷会失去正文/图片成功缓存和挑战页冷却状态，但不会删除数据库业务记录；
+- API 和 Worker 启动时会实际写入临时探针验证对象、导出和来源缓存目录；属主或挂载权限错误会让服务失败关闭，避免任务批量消耗重试；
 - 单实例 OMLX 部署建议保持 `MP_VISION_ANALYSIS_ENABLED=false`；
 - 密码和 Key 不应出现在 Compose 文件、截图、工单或 Git 历史中；
 - 示例密码仅是占位符，不能直接用于生产。
@@ -323,7 +325,7 @@ PostgreSQL 18 的持久化挂载点必须是 `/var/lib/postgresql`，不能沿�
 GitHub Actions 自动构建只由 `v*` 标签触发：
 
 ```text
-push v1.0.3 tag -> 构建并发布 API/Web 镜像
+push v1.0.4 tag -> 构建并发布 API/Web 镜像
 push main commit -> 不构建镜像
 push 文档提交 -> 不构建镜像
 ```
@@ -334,8 +336,8 @@ push 文档提交 -> 不构建镜像
 
 ```bash
 git status --short
-git tag -a v1.0.3 -m 'Release v1.0.3'
-git push origin v1.0.3
+git tag -a v1.0.4 -m 'Release v1.0.4'
+git push origin v1.0.4
 ```
 
 等待 GitHub Actions 的 API 和 Web 镜像均发布成功后再升级生产环境。
@@ -345,7 +347,7 @@ git push origin v1.0.3
 先备份，再修改 `.env` 中的固定版本：
 
 ```dotenv
-MP_IMAGE_TAG=1.0.3
+MP_IMAGE_TAG=1.0.4
 ```
 
 然后执行：
@@ -388,7 +390,7 @@ docker compose --env-file .env -f compose.prod.yaml up -d --no-deps --force-recr
 
 ### 首页返回 500 或循环重定向
 
-确认使用 `1.0.3` 或更高正式版本的 Web 镜像，并检查实际镜像标签：
+确认使用 `1.0.4` 或更高正式版本的 Web 镜像，并检查实际镜像标签：
 
 ```bash
 docker compose --env-file .env -f compose.prod.yaml images
@@ -440,7 +442,7 @@ docker inspect metric-pulse-postgres-1
 
 | 项目 | 当前值 |
 | --- | --- |
-| 平台版本 | `1.0.3` |
+| 平台版本 | `1.0.4` |
 | NAS 架构 | `x86_64` |
 | 部署目录 | `/volume2/docker/metric-pulse-platform` |
 | Web 地址 | `http://10.0.0.7:56123` |
