@@ -1,13 +1,22 @@
-# v1.1.2-nas1 只在同依赖、同迁移的补丁发布中复用已验证的 v1.1.0 amd64 运行时。
-# 正式 Dockerfile 会在该标签触发后立即恢复；此提交不得用于依赖或浏览器版本升级。
-FROM ghcr.io/xingzichen/metric-pulse-platform-api:1.1.0
-
-USER root
+FROM ghcr.io/astral-sh/uv:0.9 AS uv
+FROM python:3.14-slim AS runtime
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PATH=/app/.venv/bin:$PATH \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends antiword \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
+COPY --from=uv /uv /uvx /bin/
 COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+RUN playwright install --with-deps chromium && chmod -R a+rX /ms-playwright
 COPY src ./src
+COPY alembic.ini ./
+COPY migrations ./migrations
 RUN uv sync --frozen --no-dev
-LABEL org.opencontainers.image.version="1.1.2" \
-      org.opencontainers.image.revision="e2d0121357030d805a46fb982f092d0515b88096" \
-      org.opencontainers.image.base.name="ghcr.io/xingzichen/metric-pulse-platform-api:1.1.0"
+RUN useradd --create-home --uid 10001 metric \
+    && mkdir -p /data/objects /data/exports /data/source-cache \
+    && chown -R metric:metric /app /data
 USER metric
+EXPOSE 8000
+CMD ["metric-pulse-api"]
