@@ -15,6 +15,7 @@ from metric_pulse.collector import (
     apply_source_provenance,
     apply_verification,
     build_search_query,
+    build_search_query_plan,
     enrich_document_image_tables,
     evidence_from_documents,
     extract_structured_values,
@@ -225,18 +226,20 @@ def test_apply_source_provenance_fills_only_missing_targets() -> None:
     }
 
 
-def test_search_query_prioritizes_metric_location_date_and_unit() -> None:
+def test_search_query_uses_only_metric_smallest_location_and_normalized_time() -> None:
     record = DataRecord(
         sheet_name="人工智能指标库\uff08ai_index\uff09",
         source_row=80,
         business_key="sample",
-        raw_data={"unit": "亿元"},
+        raw_data={"unit": "亿元", "be_unit": "枚"},
         row_contract={
             "descriptors": {
                 "classification_level1": "产业规模与市场规模",
                 "region": "中国",
                 "province": "天津市",
                 "city": "天津市",
+                "district": "滨海新区",
+                "other_region": "京津冀经济区",
                 "statistical_date": 2023,
                 "industry": "人工智能",
                 "index_name": "AI存储产业规模",
@@ -246,11 +249,99 @@ def test_search_query_prioritizes_metric_location_date_and_unit() -> None:
 
     query = build_search_query(record)
 
-    assert query.startswith('"AI存储产业规模"')
-    assert "天津市" in query
-    assert "2023" in query
-    assert "亿元" in query
+    assert query == "AI存储产业规模 滨海新区 2023年 亿元"
+    assert '"' not in query
+    assert "天津市" not in query
+    assert "京津冀经济区" not in query
+    assert "枚" not in query
+    assert "人工智能" not in query
     assert "产业规模与市场规模" not in query
+
+
+@pytest.mark.parametrize(
+    ("statistical_date", "expected_time", "granularity"),
+    [
+        ("2024", "2024年", "year"),
+        ("2024-06", "2024年6月", "year_month"),
+        ("2024/06/30", "2024年6月", "year_month"),
+        ("2024Q3", "2024年第3季度", "year_quarter"),
+        ("2024年第二季度", "2024年第2季度", "year_quarter"),
+        ("2025E", "2025年", "year"),
+    ],
+)
+def test_search_query_normalizes_statistical_time_granularity(
+    statistical_date, expected_time, granularity
+) -> None:
+    record = DataRecord(
+        sheet_name="人工智能指标库(ai_index)",
+        source_row=10,
+        business_key="time",
+        raw_data={},
+        row_contract={
+            "descriptors": {
+                "index_name": "人工智能产业规模",
+                "region": "中国",
+                "statistical_date": statistical_date,
+            }
+        },
+    )
+
+    plan = build_search_query_plan(record)
+
+    assert plan["query"] == f"人工智能产业规模 中国 {expected_time}"
+    assert plan["statistical_time"]["granularity"] == granularity
+    assert plan["standard_unit"] is None
+    assert plan["strategy_version"] == "metric-minimal-scope-time-v1"
+
+
+def test_search_query_uses_economic_zone_when_no_smaller_administrative_area() -> None:
+    record = DataRecord(
+        sheet_name="人工智能指标库(ai_index)",
+        source_row=10,
+        business_key="economic-zone",
+        raw_data={},
+        row_contract={
+            "descriptors": {
+                "index_name": "算力规模",
+                "region": "中国",
+                "other_region": "长三角经济区",
+                "statistical_date": "2025Q1",
+            }
+        },
+    )
+
+    plan = build_search_query_plan(record)
+
+    assert plan["query"] == "算力规模 长三角经济区 2025年第1季度"
+    assert plan["location"] == {
+        "field": "other_region",
+        "kind": "economic_zone",
+        "value": "长三角经济区",
+    }
+
+
+def test_search_query_adds_standard_unit_but_never_source_unit() -> None:
+    record = DataRecord(
+        sheet_name="人工智能指标库(ai_index)",
+        source_row=10,
+        business_key="unit",
+        raw_data={"unit": "%", "be_unit": "百分点"},
+        row_contract={
+            "standard_unit": "%",
+            "source_unit_hint": "百分点",
+            "descriptors": {
+                "index_name": "人工智能采用率",
+                "region": "全球",
+                "statistical_date": 2025,
+            },
+        },
+    )
+
+    plan = build_search_query_plan(record)
+
+    assert plan["query"] == "人工智能采用率 全球 2025年 %"
+    assert plan["standard_unit"] == {"field": "unit", "value": "%"}
+    assert "百分点" not in plan["query"]
 
 
 def test_unapproved_verification_keeps_candidate_url_out_of_target_values() -> None:
@@ -327,8 +418,18 @@ def test_structured_source_still_runs_two_independent_qwen_calls(monkeypatch) ->
     assert len(calls) == 2
     assert [item["phase"] for item in result.model_calls] == ["SYNTHESIZE", "VERIFY"]
     assert result.search_attempt["result_count"] == 1
+    assert result.search_attempt["query_plan"] == {
+        "strategy_version": "metric-minimal-scope-time-v1",
+        "identity": None,
+        "location": {"field": "region", "kind": "region", "value": "China"},
+        "statistical_time": None,
+        "standard_unit": None,
+        "terms": ["China"],
+        "query": "China",
+    }
     assert result.acquisition_attempt["route"] == "SEARCH_FALLBACK"
     assert result.acquisition_attempt["reason"] == "NO_DIRECT_SOURCE"
+    assert result.acquisition_attempt["search_query_plan"] == result.search_attempt["query_plan"]
     assert "deterministic_structured_candidates" in calls[0]
 
 

@@ -1,6 +1,6 @@
 # Metric Pulse Platform 生产部署与运维手册
 
-本文档说明如何使用已发布的 Docker 镜像，在 Linux 服务器或群晖 NAS 上部署、验证、升级、回滚和维护 Metric Pulse Platform。命令默认在项目部署目录执行，示例正式版本为 `1.1.0`。
+本文档说明如何使用已发布的 Docker 镜像，在 Linux 服务器或群晖 NAS 上部署、验证、升级、回滚和维护 Metric Pulse Platform。命令默认在项目部署目录执行，示例正式版本为 `1.1.1`。
 
 ## 1. 部署架构
 
@@ -81,7 +81,7 @@ cd /volume2/docker/metric-pulse-platform
 
 ```bash
 curl --fail --location --output compose.prod.yaml \
-  https://raw.githubusercontent.com/xingzichen/metric-pulse-platform/v1.1.0/compose.prod.yaml
+  https://raw.githubusercontent.com/xingzichen/metric-pulse-platform/v1.1.1/compose.prod.yaml
 ```
 
 也可以从仓库检出对应版本后复制 `compose.prod.yaml`。生产环境不需要源代码、Node.js 或 Python 开发环境。
@@ -92,7 +92,7 @@ curl --fail --location --output compose.prod.yaml \
 
 ```dotenv
 # 镜像版本与入口端口
-MP_IMAGE_TAG=1.1.0
+MP_IMAGE_TAG=1.1.1
 MP_WEB_PORT=56123
 
 # 数据库密码建议使用 openssl rand -hex 32 生成
@@ -344,7 +344,7 @@ PostgreSQL 18 的持久化挂载点必须是 `/var/lib/postgresql`，不能沿�
 GitHub Actions 自动构建只由 `v*` 标签触发：
 
 ```text
-push v1.1.0 tag -> 构建并发布 API/Web 镜像
+push v1.1.1 tag -> 构建并发布 API/Web 镜像
 push main commit -> 不构建镜像
 push 文档提交 -> 不构建镜像
 ```
@@ -355,8 +355,8 @@ push 文档提交 -> 不构建镜像
 
 ```bash
 git status --short
-git tag -a v1.1.0 -m 'Release v1.1.0'
-git push origin v1.1.0
+git tag -a v1.1.1 -m 'Release v1.1.1'
+git push origin v1.1.1
 ```
 
 等待 GitHub Actions 的 API 和 Web 镜像均发布成功后再升级生产环境。
@@ -366,7 +366,7 @@ git push origin v1.1.0
 先备份，再修改 `.env` 中的固定版本：
 
 ```dotenv
-MP_IMAGE_TAG=1.1.0
+MP_IMAGE_TAG=1.1.1
 ```
 
 然后执行：
@@ -409,7 +409,7 @@ docker compose --env-file .env -f compose.prod.yaml up -d --no-deps --force-recr
 
 ### 首页返回 500 或循环重定向
 
-确认使用 `1.1.0` 或更高正式版本的 Web 镜像，并检查实际镜像标签：
+确认使用 `1.1.1` 或更高正式版本的 Web 镜像，并检查实际镜像标签：
 
 ```bash
 docker compose --env-file .env -f compose.prod.yaml images
@@ -461,7 +461,7 @@ docker inspect metric-pulse-postgres-1
 
 | 项目 | 当前值 |
 | --- | --- |
-| 平台版本 | `1.1.0` |
+| 平台版本 | `1.1.1` |
 | NAS 架构 | `x86_64` |
 | 部署目录 | `/volume2/docker/metric-pulse-platform` |
 | Web 地址 | `http://10.0.0.7:56123` |

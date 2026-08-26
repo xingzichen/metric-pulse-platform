@@ -18,7 +18,7 @@ import re
 import socket
 import time
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
@@ -48,6 +48,7 @@ _SEARCH_THROTTLE_LOCK = asyncio.Lock()
 _LAST_SEARCH_STARTED_AT = 0.0
 _IMAGE_TABLE_PROMPT_VERSION = "image-table-v3-caption-aware-columns"
 _IMAGE_TABLE_CACHE: dict[str, dict[str, Any]] = {}
+_SEARCH_QUERY_STRATEGY_VERSION = "metric-minimal-scope-time-v1"
 
 
 @dataclass(slots=True)
@@ -1133,15 +1134,101 @@ def evaluate_direct_documents(
     return False, "TARGET_NOT_FOUND", best_diagnostics
 
 
-def build_search_query(record: DataRecord) -> str:
-    """从行契约构造紧凑搜索词，优先指标身份、地区、时间、行业和单位。
+def _search_term(value: Any) -> str:
+    """把一个工作簿值压缩成可搜索的单个词组。"""
 
-    搜索词不包含源行号或整行 JSON，减少泄漏无关字段，也避免搜索引擎被噪声描述干扰。
+    return re.sub(r"\s+", " ", str(value).strip()) if value not in (None, "") else ""
+
+
+def _smallest_location(descriptors: dict[str, Any]) -> dict[str, str] | None:
+    """选择行内最小的已知地域，不把上下级地域同时塞进搜索词。
+
+    ai_index 的 ``other_region`` 表示经济区。行政区的确定性层级优先于可能跨行政区的经济区；
+    当区县/城市/省份均为空时，经济区仍比宽泛的 ``region`` 更具体。
     """
+
+    location_fields = (
+        ("district", "district"),
+        ("city", "city"),
+        ("province", "province"),
+        ("economic_zone", "economic_zone"),
+        ("economic_region", "economic_zone"),
+        ("other_region", "economic_zone"),
+        ("region", "region"),
+        ("country", "region"),
+    )
+    for field_name, kind in location_fields:
+        value = _search_term(descriptors.get(field_name))
+        if value and value.casefold() not in {"其他", "其它", "未知", "不详", "不限", "全部", "-"}:
+            return {"field": field_name, "kind": kind, "value": value}
+    return None
+
+
+def _statistical_time(value: Any) -> dict[str, str] | None:
+    """把统计时间规范为年、年月或年季度，避免同时搜索多个时间表达。"""
+
+    if value in (None, ""):
+        return None
+    if isinstance(value, (datetime, date)):
+        return {
+            "granularity": "year_month",
+            "raw": value.isoformat(),
+            "value": f"{value.year}年{value.month}月",
+        }
+    if isinstance(value, int) or (isinstance(value, float) and value.is_integer()):
+        year = int(value)
+        if 1900 <= year <= 2200:
+            return {"granularity": "year", "raw": str(value), "value": f"{year}年"}
+
+    raw = _search_term(value)
+    compact = re.sub(r"\s+", "", raw)
+    year_pattern = r"(?P<year>(?:19|20|21)\d{2})"
+    quarter_match = re.search(
+        year_pattern + r"(?:年)?(?:[-/]?Q|第)?(?P<quarter>[1-4一二三四])(?:季度|季)?$",
+        compact,
+        re.IGNORECASE,
+    )
+    if quarter_match and (
+        re.search(r"[Qq季度季]", compact) or re.search(r"第[1-4一二三四]", compact)
+    ):
+        quarter = {"一": "1", "二": "2", "三": "3", "四": "4"}.get(
+            quarter_match.group("quarter"), quarter_match.group("quarter")
+        )
+        return {
+            "granularity": "year_quarter",
+            "raw": raw,
+            "value": f"{quarter_match.group('year')}年第{quarter}季度",
+        }
+
+    month_match = re.search(
+        year_pattern + r"(?:年|[-/.])(?P<month>0?[1-9]|1[0-2])(?:月|(?:[-/.]\d{1,2})?)?$",
+        compact,
+    )
+    if month_match:
+        return {
+            "granularity": "year_month",
+            "raw": raw,
+            "value": f"{month_match.group('year')}年{int(month_match.group('month'))}月",
+        }
+
+    year_match = re.fullmatch(year_pattern + r"年?(?:[EeFf]|预测|预计|估算)?", compact)
+    if year_match:
+        return {
+            "granularity": "year",
+            "raw": raw,
+            "value": f"{year_match.group('year')}年",
+        }
+    return {"granularity": "unparsed", "raw": raw, "value": raw}
+
+
+def build_search_query_plan(record: DataRecord) -> dict[str, Any]:
+    """构造并解释最小搜索查询：主体、最小地域、单个统计时间、可选标准单位。"""
 
     descriptors = record.row_contract.get("descriptors", {})
     identity_keys = (
         "index_name",
+        # 非 ai_index 通用表没有指标名，保留一个主体字段才能形成有效搜索；固定榜单 Profile
+        # 不走搜索降级，因此不会改变其来源口径。
         "title",
         "product_name",
         "company_name",
@@ -1151,33 +1238,62 @@ def build_search_query(record: DataRecord) -> str:
         "frame_type",
         "rank_name",
     )
-    location_keys = ("country", "region", "province", "city", "district", "other_region")
-    date_keys = ("statistical_date", "rank_year", "publish_time", "collect_date", "issue_date")
-    parts: list[str] = []
-    identity = next(
-        (str(descriptors[key]).strip() for key in identity_keys if descriptors.get(key) not in (None, "")),
-        "",
+    identity_field = next(
+        (key for key in identity_keys if _search_term(descriptors.get(key))),
+        None,
     )
-    if identity:
-        parts.append(f'"{identity}"')
-    for key in ("level", "scope"):
-        value = descriptors.get(key)
-        if value not in (None, "") and str(value) not in parts:
-            parts.append(str(value))
-    for keys in (location_keys, date_keys):
-        for key in keys:
-            value = descriptors.get(key)
-            if value not in (None, "") and str(value) not in parts:
-                parts.append(str(value))
-    industry = descriptors.get("industry")
-    if industry not in (None, "") and str(industry) not in identity:
-        parts.append(str(industry))
-    unit = record.raw_data.get("unit") or record.raw_data.get("be_unit")
-    if unit not in (None, ""):
-        parts.append(str(unit))
-    if not parts:
-        parts.append(re.sub(r"\([^)]*\)|\uff08[^\uff09]*\uff09", "", record.sheet_name).strip())
-    return " ".join(parts)
+    identity = (
+        {"field": identity_field, "value": _search_term(descriptors.get(identity_field))}
+        if identity_field
+        else None
+    )
+    location = _smallest_location(descriptors)
+    time_field = next(
+        (
+            key
+            for key in (
+                "statistical_date",
+                "rank_year",
+                "publish_time",
+                "collect_date",
+                "issue_date",
+            )
+            if descriptors.get(key) not in (None, "")
+        ),
+        None,
+    )
+    statistical_time = _statistical_time(descriptors.get(time_field)) if time_field else None
+    if statistical_time is not None:
+        statistical_time["field"] = time_field
+    standard_unit_value = _search_term(
+        record.row_contract.get("standard_unit") or record.raw_data.get("unit")
+    )
+    standard_unit = (
+        {"field": "unit", "value": standard_unit_value} if standard_unit_value else None
+    )
+
+    terms = [
+        component["value"]
+        for component in (identity, location, statistical_time, standard_unit)
+        if component and component["value"]
+    ]
+    if not terms:
+        terms.append(re.sub(r"\([^)]*\)|\uff08[^\uff09]*\uff09", "", record.sheet_name).strip())
+    return {
+        "strategy_version": _SEARCH_QUERY_STRATEGY_VERSION,
+        "identity": identity,
+        "location": location,
+        "statistical_time": statistical_time,
+        "standard_unit": standard_unit,
+        "terms": terms,
+        "query": " ".join(dict.fromkeys(terms)),
+    }
+
+
+def build_search_query(record: DataRecord) -> str:
+    """返回最小搜索词；只允许额外加入标准单位，不使用来源单位或其他噪声字段。"""
+
+    return build_search_query_plan(record)["query"]
 
 
 class OMLXCollector:
@@ -1202,7 +1318,8 @@ class OMLXCollector:
         forbes_ai50 = profile == TOP_LIST_AI_PROFILE
         fixed_snapshot_profile = github_collection or forbes_ai50
         descriptors = record.row_contract.get("descriptors", {})
-        query = build_search_query(record)
+        query_plan = build_search_query_plan(record)
+        query = query_plan["query"]
         input_source_url = next(
             (
                 value
@@ -1353,6 +1470,7 @@ class OMLXCollector:
             search_ended_at = datetime.now(UTC)
             search_attempt = {
                 "query": query,
+                "query_plan": query_plan,
                 "provider": "searxng",
                 "status": "SUCCEEDED",
                 "result_count": len(search_results),
@@ -1430,6 +1548,8 @@ class OMLXCollector:
             "started_at": acquisition_started_at,
             "ended_at": acquisition_ended_at,
         }
+        if route == "SEARCH_FALLBACK":
+            acquisition_attempt["search_query_plan"] = query_plan
         # 确定性结构化候选和网页/附件正文会一起交给模型，模型不能忽略程序匹配结果。
         evidence_text = render_source_documents(documents, descriptors)
         contact_sheet = build_contact_sheet(documents) if get_settings().vision_analysis_enabled else None

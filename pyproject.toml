@@ -1,6 +1,6 @@
 [project]
 name = "metric-pulse-platform"
-version = "1.1.0"
+version = "1.1.1"
 description = "Excel-oriented intelligent collection, review and export platform"
 requires-python = ">=3.14,<3.15"
 dependencies = [

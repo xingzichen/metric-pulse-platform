@@ -366,8 +366,9 @@ def ai_index_row_contract(
 ) -> dict[str, Any]:
     """冻结 ai_index 主体、联合约束、辅助上下文和字段角色。
 
-    ``source_unit_hint`` 仅帮助检索，不能作为已采集的 ``be_unit`` 输出。联合约束只要求
-    当前行非空的字段；空单元格表示“未指定”，不会被当成任意值的肯定证据。
+    ``source_unit_hint`` 仅帮助来源内容识别和核验，不能进入候选发现查询，也不能作为已采集的
+    ``be_unit`` 输出。联合约束只要求当前行非空的字段；空单元格表示“未指定”，不会被当成
+    任意值的肯定证据。
     """
 
     identity_fields = available(AI_INDEX_IDENTITY_FIELDS, headers)

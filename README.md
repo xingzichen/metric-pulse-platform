@@ -65,7 +65,7 @@ docker compose up --build -d
 - `ghcr.io/xingzichen/metric-pulse-platform-api`：供数据库迁移、API 和 worker 共用；
 - `ghcr.io/xingzichen/metric-pulse-platform-web`：Vue 静态文件和 Nginx 运行时。
 
-当前正式版本为 `1.1.0`。生产编排默认固定该版本，不依赖可变的 `latest` 标签：
+当前正式版本为 `1.1.1`。生产编排默认固定该版本，不依赖可变的 `latest` 标签：
 
 ```bash
 cp .env.example .env
@@ -83,7 +83,7 @@ echo "$GHCR_TOKEN" | docker login ghcr.io --username xingzichen --password-stdin
 升级或回滚时可以显式指定已经发布的不可变版本，例如：
 
 ```bash
-MP_IMAGE_TAG=1.1.0 docker compose -f compose.prod.yaml up -d --remove-orphans
+MP_IMAGE_TAG=1.1.1 docker compose -f compose.prod.yaml up -d --remove-orphans
 ```
 
 完整的服务器/NAS 准备、环境变量、首次启动、验收、备份、升级、回滚和故障处理步骤见 [生产部署与运维手册](docs/deployment.md)。仓库需要允许 Actions 写入 Packages；生产密钥只保存在部署环境的 `.env` 中，不得提交。
