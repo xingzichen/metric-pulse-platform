@@ -557,7 +557,14 @@ def test_ambiguous_direct_source_falls_back_to_one_row_search(monkeypatch) -> No
     async def fake_search(_query, *, limit):
         nonlocal searches
         searches += 1
-        return [EvidenceItem(source_url="https://example.com/search-result", title="Result")]
+        return [
+            EvidenceItem(
+                source_url="https://example.com/search-result",
+                title="Result",
+                excerpt="Search result summary",
+                metadata={"engines": ["bing", "google"]},
+            )
+        ]
 
     async def fake_gather(*_args, **_kwargs):
         nonlocal gathers
@@ -598,6 +605,15 @@ def test_ambiguous_direct_source_falls_back_to_one_row_search(monkeypatch) -> No
     assert result.acquisition_attempt["route"] == "SEARCH_FALLBACK"
     assert result.acquisition_attempt["reason"] == "AMBIGUOUS_MATCH"
     assert result.search_attempt["result_count"] == 1
+    assert result.search_attempt["results"] == [
+        {
+            "rank": 1,
+            "url": "https://example.com/search-result",
+            "title": "Result",
+            "excerpt": "Search result summary",
+            "engines": ["bing", "google"],
+        }
+    ]
 
 
 def test_production_contract_accepts_direct_or_search_route_but_not_both() -> None:

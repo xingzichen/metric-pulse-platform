@@ -30,6 +30,7 @@ from metric_pulse.models import (
     ReviewPolicy,
     ReviewStatus,
     RiskLevel,
+    RowSearchAttempt,
     TaskStatus,
     UnitSourceLink,
     UnitStatus,
@@ -172,6 +173,29 @@ def test_final_failed_unit_is_exposed_with_attempts_in_review_queue(client) -> N
             error="invalid JSON",
         )
     )
+    db.add(
+        RowSearchAttempt(
+            unit_id=unit.id,
+            query='"source" 2026 report',
+            provider="searxng",
+            status="SUCCEEDED",
+            result_count=2,
+            results=[
+                {
+                    "rank": 1,
+                    "url": "https://example.com/report",
+                    "title": "Example report",
+                    "excerpt": "The requested metric is 42.",
+                    "engines": ["google"],
+                },
+                {
+                    "rank": 2,
+                    "url": "javascript:alert(1)",
+                    "title": "Unsafe historical result",
+                },
+            ],
+        )
+    )
     db.commit()
     task_id, unit_id = task.id, unit.id
     db.close()
@@ -191,6 +215,26 @@ def test_final_failed_unit_is_exposed_with_attempts_in_review_queue(client) -> N
     assert context.json()["error"] == "model protocol error"
     assert context.json()["collectionAttempts"][0]["step"] == "VERIFY"
     assert context.json()["collectionAttempts"][0]["error"] == "invalid JSON"
+    assert context.json()["rowSearchAttempts"] == [
+        {
+            "id": context.json()["rowSearchAttempts"][0]["id"],
+            "query": '"source" 2026 report',
+            "provider": "searxng",
+            "status": "SUCCEEDED",
+            "resultCount": 2,
+            "results": [
+                {
+                    "rank": 1,
+                    "url": "https://example.com/report",
+                    "title": "Example report",
+                    "excerpt": "The requested metric is 42.",
+                    "engines": ["google"],
+                }
+            ],
+            "startedAt": context.json()["rowSearchAttempts"][0]["startedAt"],
+            "endedAt": None,
+        }
+    ]
 
 
 def test_final_failed_unit_can_be_fully_corrected_without_hiding_failure(client) -> None:

@@ -1326,6 +1326,8 @@ class OMLXCollector:
                         "rank": index,
                         "url": item.source_url,
                         "title": item.title,
+                        "excerpt": item.excerpt,
+                        "engines": item.metadata.get("engines") or [],
                     }
                     for index, item in enumerate(search_results, start=1)
                 ],

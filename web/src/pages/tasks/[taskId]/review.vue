@@ -91,9 +91,7 @@ const fieldLabel = (field: string) => fieldLabels[field] || field;
 const rowContract = computed(
   () => context.data.value?.record?.rowContract || {},
 );
-const isAiIndex = computed(
-  () => rowContract.value.profile === "ai_index_v1",
-);
+const isAiIndex = computed(() => rowContract.value.profile === "ai_index_v1");
 const isAlgorithmCollection = computed(
   () => rowContract.value.profile === "ai_algorithm_collection_monthly_v1",
 );
@@ -102,6 +100,11 @@ const isForbesAi50 = computed(
 );
 const isExecutionFailure = computed(
   () => context.data.value?.executionStatus === "FAILED_FINAL",
+);
+const usesSearchFallback = computed(() =>
+  (context.data.value?.acquisitionAttempts || []).some(
+    (attempt) => attempt.route === "SEARCH_FALLBACK",
+  ),
 );
 const algorithmApplicationFields = new Set([
   "logic_id",
@@ -212,10 +215,7 @@ watch(
     for (const field of data?.targetFields || []) corrected[field] = null;
     Object.assign(corrected, data?.finalValues || data?.suggestion || {});
     comment.value = "";
-    if (
-      data?.targetFields.includes("source_url") &&
-      !corrected.source_url
-    ) {
+    if (data?.targetFields.includes("source_url") && !corrected.source_url) {
       const selectedUrls = Array.from(
         new Set(
           (data.evidence || [])
@@ -308,7 +308,9 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
   <div class="page-head">
     <div>
       <h1>逐行核对</h1>
-      <div class="muted">左侧原始与过程数据，右侧采集建议、来源证据和最终值</div>
+      <div class="muted">
+        左侧原始与过程数据，右侧采集建议、来源证据和最终值
+      </div>
     </div>
     <el-select v-model="executionFilter" style="width: 170px"
       ><el-option
@@ -344,7 +346,11 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
           (rows: Unit[]) => (selectedIds = rows.map((row) => row.id))
         "
         height="650"
-        ><el-table-column type="selection" width="44" :selectable="canBulkApprove" />
+        ><el-table-column
+          type="selection"
+          width="44"
+          :selectable="canBulkApprove"
+        />
         <el-table-column label="行"
           ><template #default="s">{{
             s.row.record?.sourceRow || s.row.id.slice(0, 6)
@@ -392,19 +398,31 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
               <el-descriptions :column="2" border>
                 <el-descriptions-item label="证据核验">
                   <StatusTag
-                    :value="context.data.value.validation?.evidence_approved ? 'MATCHED' : 'UNRESOLVED'"
+                    :value="
+                      context.data.value.validation?.evidence_approved
+                        ? 'MATCHED'
+                        : 'UNRESOLVED'
+                    "
                   />
                 </el-descriptions-item>
                 <el-descriptions-item label="行约束">
                   <StatusTag
-                    :value="context.data.value.validation?.contract_valid ? 'MATCHED' : 'UNMATCHED'"
+                    :value="
+                      context.data.value.validation?.contract_valid
+                        ? 'MATCHED'
+                        : 'UNMATCHED'
+                    "
                   />
                 </el-descriptions-item>
                 <el-descriptions-item label="换算方式">
-                  <StatusTag :value="String(conversionAudit?.mode || 'NOT_EVALUATED')" />
+                  <StatusTag
+                    :value="String(conversionAudit?.mode || 'NOT_EVALUATED')"
+                  />
                 </el-descriptions-item>
                 <el-descriptions-item label="换算结果">
-                  <StatusTag :value="String(conversionAudit?.status || 'NOT_EVALUATED')" />
+                  <StatusTag
+                    :value="String(conversionAudit?.status || 'NOT_EVALUATED')"
+                  />
                 </el-descriptions-item>
               </el-descriptions>
               <div v-if="constraintAudit.length" class="constraint-list">
@@ -413,7 +431,9 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
                   :key="item.field"
                   class="constraint-item"
                 >
-                  <span>{{ fieldLabel(item.field) }}：{{ item.value ?? '—' }}</span>
+                  <span
+                    >{{ fieldLabel(item.field) }}：{{ item.value ?? "—" }}</span
+                  >
                   <StatusTag :value="item.matched ? 'MATCHED' : 'UNMATCHED'" />
                 </div>
               </div>
@@ -421,59 +441,84 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
             <div v-else-if="isAlgorithmCollection" class="process-audit">
               <el-descriptions :column="2" border>
                 <el-descriptions-item label="榜单名次">
-                  第 {{ algorithmAudit.rank ?? rowContract.rank ?? '—' }} 名
+                  第 {{ algorithmAudit.rank ?? rowContract.rank ?? "—" }} 名
                 </el-descriptions-item>
                 <el-descriptions-item label="证据核验">
                   <StatusTag
-                    :value="context.data.value.validation?.evidence_approved ? 'MATCHED' : 'UNRESOLVED'"
+                    :value="
+                      context.data.value.validation?.evidence_approved
+                        ? 'MATCHED'
+                        : 'UNRESOLVED'
+                    "
                   />
                 </el-descriptions-item>
                 <el-descriptions-item label="精确收藏数">
-                  {{ algorithmAudit.exact_stargazers_count ?? '—' }}
+                  {{ algorithmAudit.exact_stargazers_count ?? "—" }}
                 </el-descriptions-item>
                 <el-descriptions-item label="收藏量换算">
-                  {{ algorithmAudit.star_transform || '精确收藏数 ÷ 1000，向下取整' }}
+                  {{
+                    algorithmAudit.star_transform ||
+                    "精确收藏数 ÷ 1000，向下取整"
+                  }}
                 </el-descriptions-item>
                 <el-descriptions-item label="快照时间" :span="2">
-                  {{ rowContract.snapshot_at || '—' }}
+                  {{ rowContract.snapshot_at || "—" }}
                 </el-descriptions-item>
               </el-descriptions>
             </div>
             <div v-else-if="isForbesAi50" class="process-audit">
               <el-descriptions :column="2" border>
                 <el-descriptions-item label="页面位置（非排名）">
-                  第 {{ forbesAudit.list_position ?? rowContract.list_position ?? '—' }} 条
+                  第
+                  {{
+                    forbesAudit.list_position ??
+                    rowContract.list_position ??
+                    "—"
+                  }}
+                  条
                 </el-descriptions-item>
                 <el-descriptions-item label="证据核验">
                   <StatusTag
-                    :value="context.data.value.validation?.evidence_approved ? 'MATCHED' : 'UNRESOLVED'"
+                    :value="
+                      context.data.value.validation?.evidence_approved
+                        ? 'MATCHED'
+                        : 'UNRESOLVED'
+                    "
                   />
                 </el-descriptions-item>
                 <el-descriptions-item label="榜单年度">
-                  {{ forbesAudit.rank_year ?? rowContract.rank_year ?? '—' }}
+                  {{ forbesAudit.rank_year ?? rowContract.rank_year ?? "—" }}
                 </el-descriptions-item>
                 <el-descriptions-item label="官方发布时间">
-                  {{ forbesAudit.datasource_date ?? corrected.datasource_date ?? '—' }}
+                  {{
+                    forbesAudit.datasource_date ??
+                    corrected.datasource_date ??
+                    "—"
+                  }}
                 </el-descriptions-item>
                 <el-descriptions-item label="官方融资原文">
-                  {{ forbesAudit.funding_raw ?? '—' }}
+                  {{ forbesAudit.funding_raw ?? "—" }}
                 </el-descriptions-item>
                 <el-descriptions-item label="程序换算公式">
-                  {{ forbesAudit.funding_formula ?? '—' }}
+                  {{ forbesAudit.funding_formula ?? "—" }}
                 </el-descriptions-item>
                 <el-descriptions-item label="本次快照时间" :span="2">
-                  {{ rowContract.snapshot_at || '—' }}
+                  {{ rowContract.snapshot_at || "—" }}
                 </el-descriptions-item>
               </el-descriptions>
-              <div class="conversion-note">福布斯 AI 50 按公司名称字母顺序展示且不设名次；这里的页面位置只用于切分单公司证据。</div>
+              <div class="conversion-note">
+                福布斯 AI 50
+                按公司名称字母顺序展示且不设名次；这里的页面位置只用于切分单公司证据。
+              </div>
             </div>
-            <pre v-else>{{ JSON.stringify(context.data.value.validation, null, 2) }}</pre>
-          </el-tab-pane
+            <pre v-else>{{
+              JSON.stringify(context.data.value.validation, null, 2)
+            }}</pre></el-tab-pane
           ><el-tab-pane label="审核历史">
             <pre>{{ JSON.stringify(context.data.value.history, null, 2) }}</pre>
           </el-tab-pane></el-tabs
         ></el-card
-        ><el-card class="card" style="margin-top: 16px"
+      ><el-card class="card" style="margin-top: 16px"
         ><template #header><b>建议值与证据</b></template
         ><el-alert
           v-if="isExecutionFailure"
@@ -484,7 +529,8 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
           show-icon
           style="margin-bottom: 16px"
         />
-        ><div
+        >
+        <div
           v-if="context.data.value.acquisitionAttempts?.length"
           class="acquisition-route"
         >
@@ -522,9 +568,7 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
               :span="3"
             >
               {{
-                getReasonLabel(
-                  context.data.value.acquisitionAttempts[0].reason,
-                )
+                getReasonLabel(context.data.value.acquisitionAttempts[0].reason)
               }}
             </el-descriptions-item>
             <el-descriptions-item label="输入链接" :span="3">
@@ -532,7 +576,8 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
                 v-if="context.data.value.acquisitionAttempts[0].inputUrl"
                 :href="context.data.value.acquisitionAttempts[0].inputUrl || ''"
                 target="_blank"
-              >{{ context.data.value.acquisitionAttempts[0].inputUrl }}</a>
+                >{{ context.data.value.acquisitionAttempts[0].inputUrl }}</a
+              >
               <span v-else>未提供</span>
             </el-descriptions-item>
             <el-descriptions-item
@@ -549,11 +594,90 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
                   context.data.value.acquisitionAttempts[0].normalizedUrl || ''
                 "
                 target="_blank"
-              >{{ context.data.value.acquisitionAttempts[0].normalizedUrl }}</a>
+                >{{
+                  context.data.value.acquisitionAttempts[0].normalizedUrl
+                }}</a
+              >
             </el-descriptions-item>
           </el-descriptions>
-        </div
-        ><el-descriptions :column="3" border style="margin-bottom: 16px"
+        </div>
+        <div v-if="usesSearchFallback" class="search-fallback-audit">
+          <div class="route-title">
+            <b>搜索降级结果</b>
+            <StatusTag value="SEARCH_FALLBACK" />
+          </div>
+          <div v-if="context.data.value.rowSearchAttempts?.length">
+            <section
+              v-for="search in context.data.value.rowSearchAttempts"
+              :key="search.id"
+              class="search-attempt"
+            >
+              <el-descriptions :column="3" border>
+                <el-descriptions-item label="搜索词" :span="3">
+                  {{ search.query }}
+                </el-descriptions-item>
+                <el-descriptions-item label="搜索服务">
+                  {{ search.provider }}
+                </el-descriptions-item>
+                <el-descriptions-item label="搜索状态">
+                  <StatusTag :value="search.status" />
+                </el-descriptions-item>
+                <el-descriptions-item label="返回结果">
+                  {{ search.resultCount }} 条
+                </el-descriptions-item>
+              </el-descriptions>
+              <el-alert
+                v-if="search.resultCount === 0"
+                title="本次搜索没有返回候选结果"
+                description="已保留搜索词和执行记录，请人工改用更合适的关键词继续调查。"
+                type="warning"
+                :closable="false"
+                show-icon
+                class="search-empty"
+              />
+              <div v-else class="search-result-list">
+                <article
+                  v-for="result in search.results"
+                  :key="`${search.id}-${result.rank}-${result.url}`"
+                  class="search-result"
+                >
+                  <div class="search-result-head">
+                    <span class="search-rank">{{ result.rank || "—" }}</span>
+                    <a
+                      :href="result.url"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      >{{ result.title || result.url }}</a
+                    >
+                  </div>
+                  <p v-if="result.excerpt">{{ result.excerpt }}</p>
+                  <div class="search-result-meta">
+                    <span>{{ result.url }}</span>
+                    <span v-if="result.engines.length">
+                      搜索引擎：{{ result.engines.join("、") }}
+                    </span>
+                  </div>
+                </article>
+                <el-alert
+                  v-if="search.results.length < search.resultCount"
+                  :title="`搜索返回 ${search.resultCount} 条，其中 ${search.results.length} 条具有可安全打开的 HTTP(S) 链接`"
+                  type="info"
+                  :closable="false"
+                  show-icon
+                />
+              </div>
+            </section>
+          </div>
+          <el-alert
+            v-else
+            title="已记录搜索降级，但缺少逐项搜索审计"
+            description="该记录来自旧版或异常中断流程，请结合采集尝试和原始条件人工调查。"
+            type="warning"
+            :closable="false"
+            show-icon
+          />
+        </div>
+        <el-descriptions :column="3" border style="margin-bottom: 16px"
           ><el-descriptions-item label="解决状态"
             ><StatusTag
               :value="
@@ -564,72 +688,129 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
           }}</el-descriptions-item
           ><el-descriptions-item label="风险"
             ><StatusTag
-              :value="
-                context.data.value.riskLevel
-              " /></el-descriptions-item></el-descriptions
-        ><div v-if="isAiIndex" class="conversion-card">
+              :value="context.data.value.riskLevel" /></el-descriptions-item
+        ></el-descriptions>
+        <div v-if="isAiIndex" class="conversion-card">
           <div class="route-title">
             <b>原始值与标准值换算</b>
-            <StatusTag :value="String(conversionAudit?.mode || 'NOT_EVALUATED')" />
+            <StatusTag
+              :value="String(conversionAudit?.mode || 'NOT_EVALUATED')"
+            />
           </div>
           <div class="conversion-flow">
             <div>
               <span>来源原始数据</span>
-              <strong>{{ corrected.be_data ?? '—' }} {{ corrected.be_unit || '（无量纲）' }}</strong>
+              <strong
+                >{{ corrected.be_data ?? "—" }}
+                {{ corrected.be_unit || "（无量纲）" }}</strong
+              >
             </div>
             <span class="conversion-arrow">→</span>
             <div>
               <span>标准数据</span>
-              <strong>{{ conversionInputsChanged ? '保存时自动重算' : (conversionAudit?.result ?? corrected.data ?? '—') }} {{ rowContract.standard_unit || '（无量纲）' }}</strong>
+              <strong
+                >{{
+                  conversionInputsChanged
+                    ? "保存时自动重算"
+                    : (conversionAudit?.result ?? corrected.data ?? "—")
+                }}
+                {{ rowContract.standard_unit || "（无量纲）" }}</strong
+              >
             </div>
           </div>
           <el-descriptions v-if="conversionAudit" :column="2" border>
             <el-descriptions-item label="换算状态">
-              <StatusTag :value="String(conversionAudit.status || 'NOT_EVALUATED')" />
+              <StatusTag
+                :value="String(conversionAudit.status || 'NOT_EVALUATED')"
+              />
             </el-descriptions-item>
-            <el-descriptions-item label="规则版本">{{ conversionAudit.rule_version || '—' }}</el-descriptions-item>
-            <el-descriptions-item label="计算公式" :span="2">{{ conversionAudit.formula || '—' }}</el-descriptions-item>
-            <el-descriptions-item v-if="conversionAudit.reason" label="说明" :span="2">{{ conversionAudit.reason }}</el-descriptions-item>
+            <el-descriptions-item label="规则版本">{{
+              conversionAudit.rule_version || "—"
+            }}</el-descriptions-item>
+            <el-descriptions-item label="计算公式" :span="2">{{
+              conversionAudit.formula || "—"
+            }}</el-descriptions-item>
+            <el-descriptions-item
+              v-if="conversionAudit.reason"
+              label="说明"
+              :span="2"
+              >{{ conversionAudit.reason }}</el-descriptions-item
+            >
           </el-descriptions>
-          <div class="conversion-note">标准值由系统根据来源原始值、来源原始单位和标准单位生成，人工修正时会再次重算。</div>
-        </div
-        ><div v-if="isAlgorithmCollection" class="conversion-card">
+          <div class="conversion-note">
+            标准值由系统根据来源原始值、来源原始单位和标准单位生成，人工修正时会再次重算。
+          </div>
+        </div>
+        <div v-if="isAlgorithmCollection" class="conversion-card">
           <div class="route-title">
             <b>GitHub 月度前十快照</b>
             <StatusTag value="DIRECT_LINK" />
           </div>
           <el-descriptions :column="3" border>
-            <el-descriptions-item label="当前排名">第 {{ corrected.rank ?? '—' }} 名</el-descriptions-item>
-            <el-descriptions-item label="项目名称">{{ corrected.name ?? '—' }}</el-descriptions-item>
-            <el-descriptions-item label="收藏量">{{ corrected.star ?? '—' }} {{ corrected.star_unit || 'k' }}</el-descriptions-item>
-            <el-descriptions-item label="采集时间" :span="3">{{ corrected.collect_date ?? '—' }}</el-descriptions-item>
+            <el-descriptions-item label="当前排名"
+              >第 {{ corrected.rank ?? "—" }} 名</el-descriptions-item
+            >
+            <el-descriptions-item label="项目名称">{{
+              corrected.name ?? "—"
+            }}</el-descriptions-item>
+            <el-descriptions-item label="收藏量"
+              >{{ corrected.star ?? "—" }}
+              {{ corrected.star_unit || "k" }}</el-descriptions-item
+            >
+            <el-descriptions-item label="采集时间" :span="3">{{
+              corrected.collect_date ?? "—"
+            }}</el-descriptions-item>
           </el-descriptions>
-          <div class="conversion-note">排名、时间、来源和固定元数据由系统生成；人工只需在必要时修正项目名称或整数 k 收藏量。</div>
-        </div
-        ><div v-if="isForbesAi50" class="conversion-card">
+          <div class="conversion-note">
+            排名、时间、来源和固定元数据由系统生成；人工只需在必要时修正项目名称或整数
+            k 收藏量。
+          </div>
+        </div>
+        <div v-if="isForbesAi50" class="conversion-card">
           <div class="route-title">
             <b>福布斯年度 AI 50 官方快照</b>
             <StatusTag value="DIRECT_LINK" />
           </div>
           <el-descriptions :column="3" border>
-            <el-descriptions-item label="公司">{{ corrected.company_name ?? '—' }}</el-descriptions-item>
-            <el-descriptions-item label="总部">{{ corrected.headquarter_location ?? '—' }}</el-descriptions-item>
-            <el-descriptions-item label="首席执行官">{{ corrected.CEO ?? '—' }}</el-descriptions-item>
-            <el-descriptions-item label="筹资金额">{{ corrected.financing_amount ?? '—' }} {{ corrected.financing_amount_unit || '亿美元' }}</el-descriptions-item>
-            <el-descriptions-item label="成立时间">{{ corrected.establish_date ?? '—' }}</el-descriptions-item>
-            <el-descriptions-item label="榜单年度">{{ corrected.rank_year ?? '—' }}</el-descriptions-item>
-            <el-descriptions-item label="采集时间" :span="3">{{ corrected.collection_date ?? '—' }}</el-descriptions-item>
+            <el-descriptions-item label="公司">{{
+              corrected.company_name ?? "—"
+            }}</el-descriptions-item>
+            <el-descriptions-item label="总部">{{
+              corrected.headquarter_location ?? "—"
+            }}</el-descriptions-item>
+            <el-descriptions-item label="首席执行官">{{
+              corrected.CEO ?? "—"
+            }}</el-descriptions-item>
+            <el-descriptions-item label="筹资金额"
+              >{{ corrected.financing_amount ?? "—" }}
+              {{
+                corrected.financing_amount_unit || "亿美元"
+              }}</el-descriptions-item
+            >
+            <el-descriptions-item label="成立时间">{{
+              corrected.establish_date ?? "—"
+            }}</el-descriptions-item>
+            <el-descriptions-item label="榜单年度">{{
+              corrected.rank_year ?? "—"
+            }}</el-descriptions-item>
+            <el-descriptions-item label="采集时间" :span="3">{{
+              corrected.collection_date ?? "—"
+            }}</el-descriptions-item>
           </el-descriptions>
-          <div class="conversion-note">融资额优先由官方百万美元数值确定性换算为亿美元；来源、年度、时间和批次状态由系统锁定。正式导出完整 50 家后，旧活动批次才会统一标记为删除。</div>
-        </div
-        ><el-form label-position="top"
+          <div class="conversion-note">
+            融资额优先由官方百万美元数值确定性换算为亿美元；来源、年度、时间和批次状态由系统锁定。正式导出完整
+            50 家后，旧活动批次才会统一标记为删除。
+          </div>
+        </div>
+        <el-form label-position="top"
           ><el-form-item
             v-for="field in context.data.value.targetFields"
             :key="field"
             :label="fieldLabel(field)"
             ><el-input
               v-if="
-                (isAlgorithmCollection && algorithmApplicationFields.has(field)) ||
+                (isAlgorithmCollection &&
+                  algorithmApplicationFields.has(field)) ||
                 (isForbesAi50 &&
                   forbesApplicationFields.has(field) &&
                   !(isExecutionFailure && field === 'datasource_date'))
@@ -656,12 +837,16 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
             </el-select>
             <el-input
               v-else-if="isAiIndex && field === 'data'"
-              :model-value="conversionInputsChanged ? '保存时自动重算' : corrected[field]"
+              :model-value="
+                conversionInputsChanged ? '保存时自动重算' : corrected[field]
+              "
               disabled
               placeholder="由系统自动换算，无需人工填写"
             />
-            <el-input v-else v-model="corrected[field]" />
-          </el-form-item></el-form
+            <el-input
+              v-else
+              v-model="corrected[field]"
+            /> </el-form-item></el-form
         ><el-collapse
           ><el-collapse-item
             :title="`来源证据（${context.data.value.evidence?.length || 0}）`"
@@ -687,8 +872,12 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
               >
                 <b>{{ attempt.step }}</b>
                 <StatusTag :value="attempt.status" />
-                <p v-if="attempt.error" class="attempt-error">{{ attempt.error }}</p>
-                <pre v-if="Object.keys(attempt.outputSummary || {}).length">{{ JSON.stringify(attempt.outputSummary, null, 2) }}</pre>
+                <p v-if="attempt.error" class="attempt-error">
+                  {{ attempt.error }}
+                </p>
+                <pre v-if="Object.keys(attempt.outputSummary || {}).length">{{
+                  JSON.stringify(attempt.outputSummary, null, 2)
+                }}</pre>
               </el-timeline-item>
             </el-timeline>
           </el-collapse-item></el-collapse
@@ -698,16 +887,24 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
             v-model="comment"
             type="textarea"
             :rows="2"
-            :placeholder="isExecutionFailure ? '必填：说明人工补录来源，或记录确认无法解决的调查过程' : '修正、驳回或确认未解决时填写调查说明'"
+            :placeholder="
+              isExecutionFailure
+                ? '必填：说明人工补录来源，或记录确认无法解决的调查过程'
+                : '修正、驳回或确认未解决时填写调查说明'
+            "
             style="margin-bottom: 12px"
           />
-          <el-button v-if="!isExecutionFailure" type="success" @click="decide('APPROVED')"
+          <el-button
+            v-if="!isExecutionFailure"
+            type="success"
+            @click="decide('APPROVED')"
             >确认建议（A）</el-button
           ><el-button type="primary" @click="decide('CORRECTED')"
             >保存修正（C）</el-button
           ><el-button
             v-if="
-              isExecutionFailure || ['PARTIAL', 'UNRESOLVED', 'CONFLICT'].includes(
+              isExecutionFailure ||
+              ['PARTIAL', 'UNRESOLVED', 'CONFLICT'].includes(
                 context.data.value.resolutionStatus,
               )
             "
@@ -730,6 +927,59 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
   border: 1px solid #dbe7f5;
   border-radius: 10px;
   background: #f8fbff;
+}
+.search-fallback-audit {
+  padding: 14px;
+  margin-bottom: 16px;
+  border: 1px solid #f4d19b;
+  border-radius: 10px;
+  background: #fffaf2;
+}
+.search-attempt + .search-attempt {
+  margin-top: 18px;
+}
+.search-empty,
+.search-result-list {
+  margin-top: 12px;
+}
+.search-result-list {
+  display: grid;
+  gap: 10px;
+}
+.search-result {
+  padding: 12px;
+  border: 1px solid #eadfcf;
+  border-radius: 8px;
+  background: #fff;
+}
+.search-result-head {
+  display: flex;
+  gap: 9px;
+  align-items: flex-start;
+}
+.search-rank {
+  display: inline-grid;
+  flex: 0 0 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 50%;
+  color: #92400e;
+  background: #fef3c7;
+  font-size: 12px;
+  font-weight: 700;
+}
+.search-result p {
+  margin: 8px 0;
+  color: #475569;
+  line-height: 1.6;
+}
+.search-result-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  color: #64748b;
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 .route-title {
   display: flex;

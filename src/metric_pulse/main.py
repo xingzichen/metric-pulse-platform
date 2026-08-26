@@ -53,6 +53,7 @@ from .models import (
     ReviewPolicy,
     ReviewStatus,
     Role,
+    RowSearchAttempt,
     SourceAcquisitionAttempt,
     TaskEvent,
     TaskStatus,
@@ -741,6 +742,11 @@ def review_context(
         .where(SourceAcquisitionAttempt.unit_id == unit.id)
         .order_by(desc(SourceAcquisitionAttempt.started_at))
     ).all()
+    searches = db.scalars(
+        select(RowSearchAttempt)
+        .where(RowSearchAttempt.unit_id == unit.id)
+        .order_by(desc(RowSearchAttempt.started_at))
+    ).all()
     attempts = db.scalars(
         select(CollectionAttempt)
         .where(CollectionAttempt.unit_id == unit.id)
@@ -784,6 +790,23 @@ def review_context(
             }
             for item in acquisitions
         ],
+        "rowSearchAttempts": [
+            {
+                "id": item.id,
+                "query": item.query,
+                "provider": item.provider,
+                "status": item.status,
+                "resultCount": item.result_count,
+                "results": [
+                    view
+                    for result in item.results
+                    if (view := row_search_result_view(result)) is not None
+                ],
+                "startedAt": item.started_at,
+                "endedAt": item.ended_at,
+            }
+            for item in searches
+        ],
         "collectionAttempts": [
             {
                 "id": item.id,
@@ -810,6 +833,28 @@ def review_context(
             }
             for item in history
         ],
+    }
+
+
+def row_search_result_view(result: object) -> dict[str, Any] | None:
+    """只向审核页暴露类型明确且可安全打开的历史搜索候选。"""
+
+    if not isinstance(result, dict):
+        return None
+    url = result.get("url")
+    if not isinstance(url, str) or not url.startswith(("http://", "https://")):
+        return None
+    engines = result.get("engines")
+    return {
+        "rank": result.get("rank") if isinstance(result.get("rank"), int) else None,
+        "url": url,
+        "title": result.get("title") if isinstance(result.get("title"), str) else None,
+        "excerpt": result.get("excerpt") if isinstance(result.get("excerpt"), str) else None,
+        "engines": (
+            [engine for engine in engines if isinstance(engine, str)]
+            if isinstance(engines, list)
+            else []
+        ),
     }
 
 

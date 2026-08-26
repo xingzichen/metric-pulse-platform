@@ -674,7 +674,11 @@ class SourceAdapter(Protocol):
 - 搜索全局串行，两次搜索开始至少间隔 60 秒，最多 3 次并以 60/120 秒退避；
 - 搜索摘要只是低置信线索，网页正文、文档内容或渲染图像才是主证据。
 
-每行必须保存 `SourceAcquisitionAttempt`。`RowSearchAttempt` 只在实际搜索降级时存在。GitHub `blob` 等已知展示 URL 应规范化为可下载资源，同时保存输入、规范化和最终 URL。
+每行必须保存 `SourceAcquisitionAttempt`。`RowSearchAttempt` 只在实际搜索降级时存在，并保存
+查询词、提供方、状态、实际结果数，以及每个候选的原始顺序、标题、安全 HTTP(S) URL、
+清洗后的搜索摘要和引擎列表。人工审核上下文返回这些候选，即使结果数为 0 也返回查询审计；
+审核页面把候选作为可点击的调查入口，但不得把候选自动提升为已采用证据或正式
+`source_url`。GitHub `blob` 等已知展示 URL 应规范化为可下载资源，同时保存输入、规范化和最终 URL。
 
 ### 12.2 抓取安全
 

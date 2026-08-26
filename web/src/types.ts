@@ -113,6 +113,7 @@ export interface Unit {
   };
   evidence?: Evidence[];
   acquisitionAttempts?: SourceAcquisitionAttempt[];
+  rowSearchAttempts?: RowSearchAttempt[];
   collectionAttempts?: CollectionAttempt[];
   history?: unknown[];
 }
@@ -141,6 +142,23 @@ export interface SourceAcquisitionAttempt {
   matchStatus?: string | null;
   matchCount: number;
   details: Record<string, unknown>;
+  startedAt: string;
+  endedAt?: string | null;
+}
+export interface RowSearchResult {
+  rank?: number | null;
+  url: string;
+  title?: string | null;
+  excerpt?: string | null;
+  engines: string[];
+}
+export interface RowSearchAttempt {
+  id: string;
+  query: string;
+  provider: string;
+  status: string;
+  resultCount: number;
+  results: RowSearchResult[];
   startedAt: string;
   endedAt?: string | null;
 }

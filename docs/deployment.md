@@ -192,6 +192,17 @@ docker inspect metric-pulse-migrate-1 --format 'MIGRATE_EXIT={{.State.ExitCode}}
 - `migrate` 为 `Exited (0)`；
 - Worker 日志显示 `concurrency: 1` 和 `ready`。
 
+`migrate` 是一次性作业，不应通过 `restart: always` 或空循环伪装成长驻健康服务。若 NAS
+容器界面把正常的 `Exited (0)` 显示成醒目的“已停止”，应先确认退出码为 0、数据库
+`alembic_version` 等于代码 head 且 API 健康，再移除这个无状态的已退出容器：
+
+```bash
+docker compose --env-file .env -f compose.prod.yaml rm -f migrate
+```
+
+该操作不删除数据库、镜像或卷；下次 `docker compose up` 会在启动应用前重新创建并执行
+迁移作业。非 0 退出时禁止移除，应保留容器和日志排查失败原因。
+
 ```bash
 docker logs --tail 80 metric-pulse-worker-1
 docker logs --tail 80 metric-pulse-api-1
