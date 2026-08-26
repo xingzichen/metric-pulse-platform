@@ -194,6 +194,17 @@ const evidenceSourceOptions = computed(() => {
     ).values(),
   );
 });
+const evidenceMetadataText = (metadata: Record<string, unknown>, key: string) => {
+  const value = metadata?.[key];
+  return typeof value === "string" ? value : "";
+};
+const evidenceMetadataNumber = (
+  metadata: Record<string, unknown>,
+  key: string,
+) => {
+  const value = metadata?.[key];
+  return typeof value === "number" ? value : 0;
+};
 const reviewFilterOptions = [
   "UNREVIEWED",
   "AUTO_APPROVED",
@@ -855,9 +866,55 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
               :key="e.id"
               style="padding: 10px 0; border-bottom: 1px solid #eee"
             >
-              <a v-if="e.sourceUrl" :href="e.sourceUrl" target="_blank">{{
-                e.title || e.sourceUrl
-              }}</a>
+              <div class="evidence-title">
+                <el-tag
+                  v-if="e.metadata.relation_type === 'ATTACHMENT'"
+                  type="warning"
+                  size="small"
+                  >附件</el-tag
+                >
+                <el-tag v-else size="small" effect="plain">网页</el-tag>
+                <a v-if="e.sourceUrl" :href="e.sourceUrl" target="_blank">{{
+                  evidenceMetadataText(e.metadata, "attachment_filename") ||
+                  e.title ||
+                  e.sourceUrl
+                }}</a>
+              </div>
+              <div
+                v-if="e.metadata.relation_type === 'ATTACHMENT'"
+                class="attachment-meta"
+              >
+                <a
+                  v-if="evidenceMetadataText(e.metadata, 'parent_url')"
+                  :href="evidenceMetadataText(e.metadata, 'parent_url')"
+                  target="_blank"
+                  >查看父网页</a
+                >
+                <span v-if="evidenceMetadataText(e.metadata, 'media_type')">
+                  {{ evidenceMetadataText(e.metadata, "media_type") }}
+                </span>
+                <span v-if="evidenceMetadataNumber(e.metadata, 'content_bytes')">
+                  {{
+                    Math.ceil(
+                      evidenceMetadataNumber(e.metadata, "content_bytes") / 1024,
+                    )
+                  }}
+                  KB
+                </span>
+                <span v-if="evidenceMetadataText(e.metadata, 'attachment_anchor_text')">
+                  链接文字：{{
+                    evidenceMetadataText(e.metadata, "attachment_anchor_text")
+                  }}
+                </span>
+              </div>
+              <el-alert
+                v-if="evidenceMetadataText(e.metadata, 'fetch_error')"
+                :title="`附件处理失败：${evidenceMetadataText(e.metadata, 'fetch_error')}`"
+                type="warning"
+                :closable="false"
+                show-icon
+                style="margin-top: 8px"
+              />
               <p>{{ e.excerpt }}</p>
             </div></el-collapse-item
           ><el-collapse-item
@@ -980,6 +1037,18 @@ onBeforeUnmount(() => window.removeEventListener("keydown", shortcut));
   color: #64748b;
   font-size: 12px;
   overflow-wrap: anywhere;
+}
+.evidence-title,
+.attachment-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  align-items: center;
+}
+.attachment-meta {
+  margin-top: 8px;
+  color: #64748b;
+  font-size: 12px;
 }
 .route-title {
   display: flex;

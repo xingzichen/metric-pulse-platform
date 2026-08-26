@@ -68,6 +68,11 @@ class Settings(BaseSettings):
     search_retry_delay_seconds: float = 60
     github_api_token: str = ""
     source_fetch_concurrency: int = 3
+    source_user_agent: str = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+    )
+    source_accept_language: str = "zh-CN,zh;q=0.9,en-US;q=0.7,en;q=0.6"
     source_cache_ttl_seconds: int = 86_400
     source_transient_cooldown_base_seconds: float = 60
     source_challenge_cooldown_seconds: float = 3_600
@@ -78,6 +83,10 @@ class Settings(BaseSettings):
     browser_settle_seconds: float = 5
     browser_min_content_chars: int = 500
     browser_site_cooldown_seconds: float = 30
+    attachment_discovery_enabled: bool = True
+    attachment_max_per_parent: int = Field(default=5, ge=0, le=20)
+    attachment_max_per_unit: int = Field(default=8, ge=0, le=50)
+    attachment_max_total_bytes: int = Field(default=50_000_000, ge=1_000_000, le=500_000_000)
     ssrf_proxy_networks: str = ""
 
     @field_validator("cors_origins", mode="before")

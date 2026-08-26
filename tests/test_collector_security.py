@@ -16,6 +16,7 @@ from metric_pulse.collector import (
     apply_verification,
     build_search_query,
     enrich_document_image_tables,
+    evidence_from_documents,
     extract_structured_values,
     focus_evidence,
     render_search_evidence,
@@ -747,6 +748,51 @@ def test_image_table_normalization_salvages_irregular_long_table_rows() -> None:
         [2, "中国", None, None],
         [3, "英国", 45.07, "备注"],
     ]
+
+
+def test_attachment_evidence_keeps_actual_and_parent_urls() -> None:
+    document = SourceDocument(
+        index=2,
+        url="https://example.com/files/report.pdf",
+        title="Official attachment",
+        media_type="application/pdf",
+        text="Sweden value 456",
+        relation_type="ATTACHMENT",
+        parent_url="https://example.com/report",
+        attachment_filename="report.pdf",
+        content_bytes=1_024,
+    )
+
+    evidence = evidence_from_documents(
+        [document],
+        selected_indices={2},
+        acquisition_route="DIRECT_LINK",
+    )[0]
+
+    assert evidence.source_url == "https://example.com/files/report.pdf"
+    assert evidence.metadata["selected"] is True
+    assert evidence.metadata["relation_type"] == "ATTACHMENT"
+    assert evidence.metadata["parent_url"] == "https://example.com/report"
+
+
+def test_rendering_allocates_context_to_every_attachment() -> None:
+    documents = [
+        SourceDocument(
+            index=index,
+            url=f"https://example.com/files/{index}.pdf",
+            media_type="application/pdf",
+            text=(f"Attachment {index} Sweden value {index}. " + "details " * 1_000),
+            relation_type="ATTACHMENT",
+            parent_url="https://example.com/report",
+        )
+        for index in range(1, 13)
+    ]
+
+    rendered = render_source_documents(documents, {"country": "Sweden"})
+
+    assert len(rendered) <= 30_000
+    assert all(f"SOURCE [{index}]" in rendered for index in range(1, 13))
+    assert all(f"Attachment {index} Sweden value {index}" in rendered for index in range(1, 13))
 
 
 def test_image_table_truncation_retries_with_larger_output_budget(monkeypatch, tmp_path) -> None:

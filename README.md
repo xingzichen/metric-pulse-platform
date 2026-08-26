@@ -16,7 +16,7 @@
 - 任务规划、启动、暂停、恢复、停止、失败重试和软删除；
 - 当前 eager `TaskProcessor` 的运行版本隔离，以及 Compose 中已配置但尚未生产切换验收的 Celery/Redis/PostgreSQL worker 路径；
 - 工作簿采集直链优先，并优先使用来源官方机器可读接口；通用 JSON 对象数组转为可确定性匹配的 CSV，直链失败/无数据/歧义时才降级到 SearXNG 前 10 条，并保存完整路由审计；
-- HTML 主文去噪、PDF/Word/图片提取；对通用图文页最多六张正文候选图结合文章标题、图片 alt/title、图注及邻近描述识别数据表，回填正文后再完整交给后续提取与复核；对 403/429、JS 空壳和过短正文提供 Playwright Chromium 回退；
+- 版本化桌面浏览器 HTTP 请求配置；HTML 主文去噪后发现一层附件，受限下载并解析 PDF/Word/XLSX/CSV/JSON/XML/文本/图片，保留父页、附件和失败审计；对通用图文页最多六张正文候选图结合文章标题、图片 alt/title、图注及邻近描述识别数据表，回填正文后再交给后续提取与复核；对 403/429、JS 空壳和过短正文提供 Playwright Chromium 回退；
 - OMLX 仅使用 `Qwen3.8-27B-6bit`、全局并发 1；每行固定串行执行多源候选综合和独立证据复核，对日期、地域、口径和单位失配失败关闭；同来源行相邻调度并复用稳定证据前缀，但不共享跨行结论；
 - 规范 URL 的正文、原图和图片派生表持久化到共享 `source-cache-data`；挑战/限流建立 URL 与域级负缓存，避免重复抓取触发验证页；
 - execution/resolution/review 三套正交状态、原因/风险分类与独立统计；
@@ -65,7 +65,7 @@ docker compose up --build -d
 - `ghcr.io/xingzichen/metric-pulse-platform-api`：供数据库迁移、API 和 worker 共用；
 - `ghcr.io/xingzichen/metric-pulse-platform-web`：Vue 静态文件和 Nginx 运行时。
 
-当前正式版本为 `1.0.4`。生产编排默认固定该版本，不依赖可变的 `latest` 标签：
+当前正式版本为 `1.1.0`。生产编排默认固定该版本，不依赖可变的 `latest` 标签：
 
 ```bash
 cp .env.example .env
@@ -83,7 +83,7 @@ echo "$GHCR_TOKEN" | docker login ghcr.io --username xingzichen --password-stdin
 升级或回滚时可以显式指定已经发布的不可变版本，例如：
 
 ```bash
-MP_IMAGE_TAG=1.0.4 docker compose -f compose.prod.yaml up -d --remove-orphans
+MP_IMAGE_TAG=1.1.0 docker compose -f compose.prod.yaml up -d --remove-orphans
 ```
 
 完整的服务器/NAS 准备、环境变量、首次启动、验收、备份、升级、回滚和故障处理步骤见 [生产部署与运维手册](docs/deployment.md)。仓库需要允许 Actions 写入 Packages；生产密钥只保存在部署环境的 `.env` 中，不得提交。

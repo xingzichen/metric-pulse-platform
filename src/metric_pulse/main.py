@@ -34,6 +34,7 @@ from sqlalchemy import case, desc, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
+from . import __version__
 from .celery_app import dispatch_task
 from .config import get_settings
 from .dataset_profiles import excluded_sheet_policy, has_locked_dataset_profile
@@ -117,7 +118,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="Metric Pulse Platform API",
-    version="0.1.0",
+    version=__version__,
     lifespan=lifespan,
 )
 app.add_middleware(

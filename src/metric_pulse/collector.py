@@ -108,7 +108,9 @@ def raise_for_source_cooldown(documents: list[SourceDocument]) -> None:
     active = [
         document
         for document in documents
-        if document.source_cooldown_until and document.source_cooldown_until > time.time()
+        if document.relation_type != "ATTACHMENT"
+        and document.source_cooldown_until
+        and document.source_cooldown_until > time.time()
     ]
     if not active:
         return
@@ -953,25 +955,33 @@ def render_source_documents(
 ) -> str:
     """将规范化文档渲染为模型可引用的编号来源集合。"""
 
+    usable_documents = [
+        document
+        for document in documents
+        if document.relation_type != "ATTACHMENT" or document.text or document.images
+    ]
+    # 父页与附件都必须获得一个上下文分片；根据来源数量动态分配，避免前几个
+    # 搜索网页将 30K 预算耗尽后把附件整体截掉。全文仍保留于解析缓存和结构化匹配。
+    content_budget = max(600, min(2_500, max_chars // max(1, len(usable_documents)) - 650))
     blocks: list[str] = []
-    for document in documents:
-        # 图片表格已经转成可引用正文，必须整体交给 SYNTHESIZE/VERIFY；
-        # 普通长页仍使用描述字段附近窗口以避免挤占模型上下文。
-        main_content = (
-            document.text
-            if any(item.get("has_data_table") is True for item in document.image_table_results)
-            else focus_evidence(document.text, descriptors, max_chars=2_500)
-        )
+    for document in usable_documents:
+        main_content = focus_evidence(document.text, descriptors, max_chars=content_budget)
         parts = [
             f"SOURCE [{document.index}]",
             f"Title: {document.title or 'Untitled'}",
             f"URL: {document.url}",
             f"Type: {document.media_type}",
         ]
+        if document.relation_type == "ATTACHMENT":
+            parts.append(f"Relation: attachment of {document.parent_url}")
+            if document.attachment_filename:
+                parts.append(f"Attachment filename: {document.attachment_filename}")
+            if document.attachment_anchor_text:
+                parts.append(f"Parent link text: {document.attachment_anchor_text}")
         if document.browser_rendered:
             parts.append(f"Acquisition: Playwright-rendered ({document.browser_fallback_reason})")
         if document.snippet:
-            parts.append(f"Search snippet: {document.snippet[:800]}")
+            parts.append(f"Search snippet: {document.snippet[:400]}")
         if main_content:
             parts.append("Main content:\n" + main_content)
         if document.images:
@@ -1009,6 +1019,14 @@ def evidence_from_documents(
                 "acquisition_route": acquisition_route,
                 "rank": document.index,
                 "media_type": document.media_type,
+                "request_profile": document.request_profile,
+                "relation_type": document.relation_type,
+                "parent_url": document.parent_url,
+                "attachment_filename": document.attachment_filename,
+                "attachment_anchor_text": document.attachment_anchor_text,
+                "attachment_context": document.attachment_context,
+                "content_bytes": document.content_bytes,
+                "attachment_count": len(document.attachment_references),
                 "image_count": len(document.images),
                 "image_table_count": sum(
                     item.get("has_data_table") is True for item in document.image_table_results
@@ -1216,6 +1234,12 @@ class OMLXCollector:
                 browser_settle_seconds=settings.browser_settle_seconds,
                 browser_min_content_chars=settings.browser_min_content_chars,
                 browser_site_cooldown_seconds=settings.browser_site_cooldown_seconds,
+                attachment_discovery_enabled=(
+                    settings.attachment_discovery_enabled and not fixed_snapshot_profile
+                ),
+                attachment_max_per_parent=settings.attachment_max_per_parent,
+                attachment_max_per_unit=settings.attachment_max_per_unit,
+                attachment_max_total_bytes=settings.attachment_max_total_bytes,
             )
             if settings.vision_analysis_enabled and settings.vision_table_enrichment_enabled:
                 for document in documents:
@@ -1352,6 +1376,12 @@ class OMLXCollector:
 
         # 将来源获取过程与内容身份固化，缓存命中也必须能追溯到规范化 URL 和内容哈希。
         acquisition_ended_at = datetime.now(UTC)
+        audited_documents = (
+            [*direct_documents, *documents]
+            if route == "SEARCH_FALLBACK" and direct_documents
+            else documents
+        )
+        model_context_ids = {id(document) for document in documents}
         source_contexts = [
             {
                 "source_context_id": hashlib.sha256(
@@ -1365,12 +1395,22 @@ class OMLXCollector:
                 "persistent_cache_hit": document.persistent_cache_hit,
                 "media_type": document.media_type,
                 "parser_version": document.parser_version,
+                "request_profile": document.request_profile,
+                "relation_type": document.relation_type,
+                "parent_url": document.parent_url,
+                "attachment_filename": document.attachment_filename,
+                "attachment_anchor_text": document.attachment_anchor_text,
+                "attachment_context": document.attachment_context,
+                "content_bytes": document.content_bytes,
+                "fetch_error": document.error,
+                "attachment_count": len(document.attachment_references),
+                "model_context_included": id(document) in model_context_ids,
                 "image_table_count": sum(
                     item.get("has_data_table") is True for item in document.image_table_results
                 ),
                 "image_table_inspected": len(document.image_table_results),
             }
-            for document in documents
+            for document in audited_documents
         ]
         acquisition_attempt = {
             "route": route,
@@ -1629,6 +1669,17 @@ class OMLXCollector:
             conflicts=verification.get("conflicts"),
             acquisition_route=route,
         )
+        if route == "SEARCH_FALLBACK" and direct_documents:
+            direct_attempt_evidence = evidence_from_documents(
+                direct_documents,
+                selected_indices=set(),
+                acquisition_route="DIRECT_LINK",
+            )
+            for item in direct_attempt_evidence:
+                item.metadata["provider"] = "direct-source-attempt"
+                item.metadata["acquisition_route"] = "DIRECT_ATTEMPT"
+                item.metadata["model_context_included"] = False
+            evidence.extend(direct_attempt_evidence)
         if forbes_ai50 and isinstance(profile_deterministic_values.get("profile_url"), str):
             # 公司详情页不参与自动值生成，避免把多页面内容混入当前模型上下文；但把官方链接
             # 直接提供给审核员，遇到榜单结构字段缺失时无需再人工搜索。

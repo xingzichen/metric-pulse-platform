@@ -1,8 +1,8 @@
 name: metric-pulse
 
 # 生产编排只拉取已经发布的镜像，不在服务器上重复构建源代码。
-# MP_IMAGE_TAG 默认固定为正式版本 1.0.4；升级或回滚时可临时指定其他不可变版本。
-x-app-image: &app-image ghcr.io/xingzichen/metric-pulse-platform-api:${MP_IMAGE_TAG:-1.0.4}
+# MP_IMAGE_TAG 默认固定为正式版本 1.1.0；升级或回滚时可临时指定其他不可变版本。
+x-app-image: &app-image ghcr.io/xingzichen/metric-pulse-platform-api:${MP_IMAGE_TAG:-1.1.0}
 
 services:
   postgres:
@@ -65,6 +65,8 @@ services:
       MP_SEARCH_MIN_INTERVAL_SECONDS: ${MP_SEARCH_MIN_INTERVAL_SECONDS:-60}
       MP_SEARCH_RETRY_DELAY_SECONDS: ${MP_SEARCH_RETRY_DELAY_SECONDS:-60}
       MP_SOURCE_FETCH_CONCURRENCY: ${MP_SOURCE_FETCH_CONCURRENCY:-3}
+      MP_SOURCE_USER_AGENT: ${MP_SOURCE_USER_AGENT:-Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36}
+      MP_SOURCE_ACCEPT_LANGUAGE: ${MP_SOURCE_ACCEPT_LANGUAGE:-zh-CN,zh;q=0.9,en-US;q=0.7,en;q=0.6}
       MP_SOURCE_CACHE_TTL_SECONDS: ${MP_SOURCE_CACHE_TTL_SECONDS:-86400}
       MP_SOURCE_TRANSIENT_COOLDOWN_BASE_SECONDS: ${MP_SOURCE_TRANSIENT_COOLDOWN_BASE_SECONDS:-60}
       MP_SOURCE_CHALLENGE_COOLDOWN_SECONDS: ${MP_SOURCE_CHALLENGE_COOLDOWN_SECONDS:-3600}
@@ -75,6 +77,10 @@ services:
       MP_BROWSER_SETTLE_SECONDS: ${MP_BROWSER_SETTLE_SECONDS:-5}
       MP_BROWSER_MIN_CONTENT_CHARS: ${MP_BROWSER_MIN_CONTENT_CHARS:-500}
       MP_BROWSER_SITE_COOLDOWN_SECONDS: ${MP_BROWSER_SITE_COOLDOWN_SECONDS:-30}
+      MP_ATTACHMENT_DISCOVERY_ENABLED: ${MP_ATTACHMENT_DISCOVERY_ENABLED:-true}
+      MP_ATTACHMENT_MAX_PER_PARENT: ${MP_ATTACHMENT_MAX_PER_PARENT:-5}
+      MP_ATTACHMENT_MAX_PER_UNIT: ${MP_ATTACHMENT_MAX_PER_UNIT:-8}
+      MP_ATTACHMENT_MAX_TOTAL_BYTES: ${MP_ATTACHMENT_MAX_TOTAL_BYTES:-50000000}
       MP_VISION_ANALYSIS_ENABLED: ${MP_VISION_ANALYSIS_ENABLED:-true}
     volumes: &app-volumes
       - object-data:/data/objects
@@ -109,7 +115,7 @@ services:
       redis: { condition: service_healthy }
 
   web:
-    image: ghcr.io/xingzichen/metric-pulse-platform-web:${MP_IMAGE_TAG:-1.0.4}
+    image: ghcr.io/xingzichen/metric-pulse-platform-web:${MP_IMAGE_TAG:-1.1.0}
     restart: unless-stopped
     ports:
       - "${MP_WEB_PORT:-8080}:80"

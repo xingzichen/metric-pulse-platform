@@ -24,8 +24,9 @@ import zipfile
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urljoin, urlparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse
 
 import httpx
 import pymupdf
@@ -33,6 +34,7 @@ import trafilatura
 from bs4 import BeautifulSoup, Tag
 from charset_normalizer import from_bytes
 from docx import Document
+from openpyxl import load_workbook
 from PIL import Image, ImageDraw, ImageOps
 
 from .config import get_settings
@@ -43,6 +45,12 @@ MAX_DOCUMENT_CHARS = 80_000
 MAX_PDF_PAGES = 50
 MAX_IMAGES_PER_SOURCE = 6
 MAX_VISION_IMAGES = 6
+MAX_DISCOVERED_ATTACHMENTS_PER_PARENT = 20
+MAX_OFFICE_ARCHIVE_FILES = 10_000
+MAX_OFFICE_UNCOMPRESSED_BYTES = 100_000_000
+MAX_OFFICE_COMPRESSION_RATIO = 200
+SOURCE_REQUEST_PROFILE = "http-desktop-chrome-zh-v1"
+BROWSER_REQUEST_PROFILE = "playwright-desktop-zh-v1"
 BOILERPLATE_TAGS = {
     "script",
     "style",
@@ -90,7 +98,7 @@ BROWSER_EXCLUDED_SUFFIXES = {
 _SOURCE_CACHE: dict[str, SourceDocument] = {}
 _SOURCE_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 _SOURCE_CACHE_MAX_ITEMS = 2_048
-_PARSER_VERSION = "source-pipeline-v5-shared-cache-images-and-cooldowns"
+_PARSER_VERSION = "source-pipeline-v6-request-profile-and-main-attachments"
 IMAGE_MARKER_PATTERN = re.compile(r"\[\[METRIC_PULSE_IMAGE:\d+\]\]")
 _TRACKING_QUERY_KEYS = {
     "fbclid",
@@ -100,6 +108,43 @@ _TRACKING_QUERY_KEYS = {
     "ref",
     "ref_src",
 }
+_SUPPORTED_ATTACHMENT_SUFFIXES = {
+    ".csv",
+    ".doc",
+    ".docx",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".json",
+    ".pdf",
+    ".png",
+    ".tsv",
+    ".txt",
+    ".webp",
+    ".xlsx",
+    ".xml",
+}
+_UNSUPPORTED_ATTACHMENT_SUFFIXES = {".7z", ".ppt", ".pptx", ".rar", ".xls", ".zip"}
+_ATTACHMENT_MEDIA_TYPES = {
+    "application/json",
+    "application/msword",
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/xml",
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "text/csv",
+    "text/plain",
+    "text/tab-separated-values",
+    "text/xml",
+}
+_ATTACHMENT_HINT_PATTERN = re.compile(
+    r"(?:\bdownload\b|\battachment\b|\bappendix\b|附件|下载|全文|附表|数据表)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(slots=True)
@@ -109,6 +154,21 @@ class ImageReference:
     url: str
     description: str
     marker: str
+    referer: str | None = None
+
+
+@dataclass(slots=True)
+class AttachmentReference:
+    """网页主正文内的一个附件候选；链接发现与内容下载分开审计。"""
+
+    url: str
+    parent_url: str
+    anchor_text: str = ""
+    surrounding_text: str = ""
+    filename: str | None = None
+    declared_media_type: str | None = None
+    supported: bool = True
+    unsupported_reason: str | None = None
 
 
 @dataclass(slots=True)
@@ -152,11 +212,50 @@ class SourceDocument:
     normalized_url: str | None = None
     cache_key: str | None = None
     content_hash: str | None = None
+    content_bytes: int = 0
+    request_profile: str = SOURCE_REQUEST_PROFILE
+    relation_type: str = "PRIMARY"
+    parent_url: str | None = None
+    attachment_filename: str | None = None
+    attachment_anchor_text: str | None = None
+    attachment_context: str | None = None
+    attachment_references: list[AttachmentReference] = field(default_factory=list)
     parser_version: str = _PARSER_VERSION
 
 
 class BrowserChallengeError(RuntimeError):
     """公开页面要求真人验证；采集器记录失败但不会尝试绕过。"""
+
+
+def _safe_referer(parent_url: str | None, target_url: str) -> str | None:
+    """生成不携查询参数或凭证的父页 Referer；跨域仅发送 origin。"""
+
+    if not parent_url:
+        return None
+    parent = urlparse(parent_url)
+    target = urlparse(target_url)
+    if parent.scheme not in {"http", "https"} or not parent.netloc or parent.username:
+        return None
+    path = (parent.path or "/") if parent.hostname == target.hostname else "/"
+    return parent._replace(path=path, params="", query="", fragment="").geturl()
+
+
+def source_request_headers(url: str, *, referer: str | None = None) -> dict[str, str]:
+    """返回一致、可版本化的桌面浏览器导航头，不伪造 Chromium 专属指纹。"""
+
+    settings = get_settings()
+    headers = {
+        "User-Agent": settings.source_user_agent,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,"
+            "text/plain;q=0.7,*/*;q=0.5"
+        ),
+        "Accept-Language": settings.source_accept_language,
+        "Upgrade-Insecure-Requests": "1",
+    }
+    if safe_referer := _safe_referer(referer, url):
+        headers["Referer"] = safe_referer
+    return headers
 
 
 def normalize_source_url(url: str) -> str:
@@ -314,6 +413,12 @@ def _is_permanent_source_error(error: str) -> bool:
         for marker in (
             "Only public HTTP(S) URLs are allowed",
             "Private, loopback, and reserved evidence addresses are not allowed",
+            "source exceeds",
+            "unsupported attachment format",
+            "ATTACHMENT_",
+            "office attachment contains too many archive entries",
+            "office attachment uncompressed content is too large",
+            "office attachment compression ratio is unsafe",
         )
     )
 
@@ -486,6 +591,24 @@ def _load_persistent_document(
     image_table_results = (
         payload.get("image_table_results") if isinstance(payload.get("image_table_results"), list) else []
     )
+    attachment_references = [
+        AttachmentReference(
+            url=str(item["url"]),
+            parent_url=str(item.get("parent_url") or payload.get("final_url") or normalized_url),
+            anchor_text=str(item.get("anchor_text") or ""),
+            surrounding_text=str(item.get("surrounding_text") or ""),
+            filename=str(item["filename"]) if item.get("filename") else None,
+            declared_media_type=(
+                str(item["declared_media_type"]) if item.get("declared_media_type") else None
+            ),
+            supported=item.get("supported") is not False,
+            unsupported_reason=(
+                str(item["unsupported_reason"]) if item.get("unsupported_reason") else None
+            ),
+        )
+        for item in payload.get("attachment_references", [])
+        if isinstance(item, dict) and item.get("url")
+    ]
     # 待识别图片元数据存在但对象丢失时不能返回只剩占位符的正文；重新抓取才能恢复证据。
     if persisted_images and not images and not image_table_results:
         return None
@@ -507,6 +630,9 @@ def _load_persistent_document(
         normalized_url=payload.get("normalized_url") or normalized_url,
         cache_key=cache_key,
         content_hash=payload.get("content_hash"),
+        content_bytes=int(payload.get("content_bytes") or 0),
+        request_profile=str(payload.get("request_profile") or SOURCE_REQUEST_PROFILE),
+        attachment_references=attachment_references,
     )
     return document if document.text else None
 
@@ -556,12 +682,29 @@ def _persist_document(cache_key: str, document: SourceDocument) -> None:
         "browser_rendered": document.browser_rendered,
         "browser_fallback_reason": document.browser_fallback_reason,
         "content_hash": document.content_hash or hashlib.sha256(document.text.encode()).hexdigest(),
+        "content_bytes": document.content_bytes,
+        "request_profile": document.request_profile,
+        "attachment_references": [
+            {
+                "url": reference.url,
+                "parent_url": reference.parent_url,
+                "anchor_text": reference.anchor_text,
+                "surrounding_text": reference.surrounding_text,
+                "filename": reference.filename,
+                "declared_media_type": reference.declared_media_type,
+                "supported": reference.supported,
+                "unsupported_reason": reference.unsupported_reason,
+            }
+            for reference in document.attachment_references
+        ],
     }
     _write_json_file(path, payload)
 
 
 def _cached_document(document: SourceDocument, candidate: Any, index: int) -> SourceDocument:
     cloned = copy.deepcopy(document)
+    metadata = getattr(candidate, "metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
     cloned.index = index
     cloned.requested_url = candidate.source_url
     # 来源证据元数据属于共享前缀；缓存命中时保留首次规范化结果，避免行级候选标题
@@ -570,6 +713,23 @@ def _cached_document(document: SourceDocument, candidate: Any, index: int) -> So
     cloned.snippet = cloned.snippet or candidate.excerpt
     cloned.cache_hit = True
     cloned.normalized_url = normalize_source_url(candidate.source_url)
+    cloned.relation_type = str(metadata.get("relation_type") or "PRIMARY")
+    cloned.parent_url = metadata.get("parent_url") if isinstance(metadata.get("parent_url"), str) else None
+    cloned.attachment_filename = (
+        metadata.get("attachment_filename")
+        if isinstance(metadata.get("attachment_filename"), str)
+        else None
+    )
+    cloned.attachment_anchor_text = (
+        metadata.get("attachment_anchor_text")
+        if isinstance(metadata.get("attachment_anchor_text"), str)
+        else None
+    )
+    cloned.attachment_context = (
+        metadata.get("attachment_context")
+        if isinstance(metadata.get("attachment_context"), str)
+        else None
+    )
     for image in cloned.images:
         image.source_index = index
     return cloned
@@ -724,8 +884,81 @@ def _compact_image_description(image: Tag) -> str:
     return " | ".join(cleaned)[:600]
 
 
-def extract_html_main_content(data: bytes, base_url: str) -> tuple[str, list[ImageReference]]:
-    """抽取网页主正文，并保留最多六张候选正文图片在文本中的位置。"""
+def _attachment_filename(link: Tag, absolute_url: str) -> str | None:
+    download = link.get("download")
+    if isinstance(download, str) and download.strip():
+        return Path(download.strip()).name[:255]
+    name = Path(urlparse(absolute_url).path).name
+    return name[:255] if name else None
+
+
+def extract_main_attachment_references(container: Tag, base_url: str) -> list[AttachmentReference]:
+    """只从正文容器发现一层附件，同时保留未支持格式供人工审核。"""
+
+    references: list[AttachmentReference] = []
+    seen: set[str] = set()
+    base_normalized = normalize_source_url(base_url)
+    for link in container.find_all("a", href=True):
+        href = link.get("href")
+        if not isinstance(href, str) or not href.strip():
+            continue
+        absolute = urljoin(base_url, href.strip())
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        absolute = parsed._replace(fragment="").geturl()
+        normalized = normalize_source_url(absolute)
+        if normalized == base_normalized or normalized in seen:
+            continue
+        suffix = Path(parsed.path).suffix.lower()
+        declared_type = link.get("type")
+        media_type = (
+            declared_type.split(";", 1)[0].strip().lower()
+            if isinstance(declared_type, str) and declared_type.strip()
+            else None
+        )
+        anchor_text = re.sub(r"\s+", " ", link.get_text(" ", strip=True)).strip()[:300]
+        is_candidate = bool(
+            suffix in _SUPPORTED_ATTACHMENT_SUFFIXES
+            or suffix in _UNSUPPORTED_ATTACHMENT_SUFFIXES
+            or link.has_attr("download")
+            or media_type in _ATTACHMENT_MEDIA_TYPES
+            or _ATTACHMENT_HINT_PATTERN.search(anchor_text)
+        )
+        if not is_candidate:
+            continue
+        parent = link.find_parent(["p", "li", "td", "th", "figcaption", "div"])
+        surrounding = (
+            re.sub(r"\s+", " ", parent.get_text(" ", strip=True)).strip()[:600]
+            if isinstance(parent, Tag)
+            else anchor_text
+        )
+        unsupported = suffix in _UNSUPPORTED_ATTACHMENT_SUFFIXES
+        reference = AttachmentReference(
+            url=absolute,
+            parent_url=base_url,
+            anchor_text=anchor_text,
+            surrounding_text=surrounding,
+            filename=_attachment_filename(link, absolute),
+            declared_media_type=media_type,
+            supported=not unsupported,
+            unsupported_reason=(f"unsupported attachment format: {suffix}" if unsupported else None),
+        )
+        if len(references) >= MAX_DISCOVERED_ATTACHMENTS_PER_PARENT:
+            reference.supported = False
+            reference.unsupported_reason = "ATTACHMENT_DISCOVERY_LIMIT_EXCEEDED"
+            references.append(reference)
+            break
+        references.append(reference)
+        seen.add(normalized)
+    return references
+
+
+def extract_html_main_content(
+    data: bytes,
+    base_url: str,
+) -> tuple[str, list[ImageReference], list[AttachmentReference]]:
+    """抽取网页正文、图片和一层附件；超过发现上限时额外保留一条超限证据。"""
 
     html_text = _decode_text(data)
     # 福布斯列表页的完整 50 条数据位于 Next.js 内嵌状态而非首屏正文。先压缩为仅含业务字段
@@ -737,13 +970,16 @@ def extract_html_main_content(data: bytes, base_url: str) -> tuple[str, list[Ima
         # 少数首屏卡片的内容后误认为完整榜单。
         forbes_snapshot = ""
     if forbes_snapshot is not None:
-        return _normalize_text(forbes_snapshot), []
+        return _normalize_text(forbes_snapshot), [], []
     soup = BeautifulSoup(html_text, "lxml")
     for tag in soup.find_all(BOILERPLATE_TAGS):
         tag.decompose()
     container = soup.find("main") or soup.find("article") or soup.find(attrs={"role": "main"})
     if not isinstance(container, Tag):
         container = soup.body if isinstance(soup.body, Tag) else soup
+    attachment_references = (
+        extract_main_attachment_references(container, base_url) if isinstance(container, Tag) else []
+    )
     ranked_images: list[tuple[int, int, Tag, str, str]] = []
     for order, image in enumerate(container.find_all("img")):
         src = image.get("data-src") or image.get("src")
@@ -777,7 +1013,14 @@ def extract_html_main_content(data: bytes, base_url: str) -> tuple[str, list[Ima
         marker_tag = soup.new_tag("p")
         marker_tag.string = marker
         image.insert_after(marker_tag)
-        references.append(ImageReference(url=absolute, description=description, marker=marker))
+        references.append(
+            ImageReference(
+                url=absolute,
+                description=description,
+                marker=marker,
+                referer=base_url,
+            )
+        )
 
     extracted = trafilatura.extract(
         str(soup),
@@ -788,7 +1031,7 @@ def extract_html_main_content(data: bytes, base_url: str) -> tuple[str, list[Ima
     )
     fallback = container.get_text("\n", strip=True)
     text = _normalize_text(extracted or fallback)
-    return text, references
+    return text, references, attachment_references
 
 
 def extract_pdf(data: bytes, source_index: int) -> tuple[str, list[ImageEvidence]]:
@@ -825,6 +1068,7 @@ def extract_pdf(data: bytes, source_index: int) -> tuple[str, list[ImageEvidence
 def extract_docx(data: bytes, source_index: int) -> tuple[str, list[ImageEvidence]]:
     """提取 DOCX 段落、表格与有限数量的内嵌图片。"""
 
+    validate_office_archive(data)
     document = Document(io.BytesIO(data))
     lines = [paragraph.text for paragraph in document.paragraphs if paragraph.text.strip()]
     for table in document.tables:
@@ -844,6 +1088,56 @@ def extract_docx(data: bytes, source_index: int) -> tuple[str, list[ImageEvidenc
                     )
                 )
     return _normalize_text("\n".join(lines)), images
+
+
+def extract_xlsx(data: bytes) -> str:
+    """以只读、公式结果模式抽取 XLSX，不执行宏也不读取外部链接。"""
+
+    validate_office_archive(data)
+    workbook = load_workbook(
+        io.BytesIO(data),
+        read_only=True,
+        data_only=True,
+        keep_links=False,
+    )
+    lines: list[str] = []
+    current_chars = 0
+    try:
+        for worksheet in workbook.worksheets[:20]:
+            header = f"Sheet: {worksheet.title}"
+            lines.append(header)
+            current_chars += len(header) + 1
+            for row_number, row in enumerate(worksheet.iter_rows(values_only=True), start=1):
+                if row_number > 5_000:
+                    lines.append("[sheet row limit reached]")
+                    break
+                values = ["" if value is None else str(value) for value in row]
+                if not any(value.strip() for value in values):
+                    continue
+                line = "\t".join(values).rstrip()
+                lines.append(line)
+                current_chars += len(line) + 1
+                if current_chars >= MAX_DOCUMENT_CHARS:
+                    lines.append("[document character limit reached]")
+                    return _normalize_text("\n".join(lines))
+    finally:
+        workbook.close()
+    return _normalize_text("\n".join(lines))
+
+
+def validate_office_archive(data: bytes) -> None:
+    """在 Office ZIP 解析前限制文件数、解压总量和压缩比，防止附件解压炸弹。"""
+
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        entries = archive.infolist()
+        if len(entries) > MAX_OFFICE_ARCHIVE_FILES:
+            raise ValueError("office attachment contains too many archive entries")
+        uncompressed = sum(entry.file_size for entry in entries)
+        compressed = sum(max(1, entry.compress_size) for entry in entries)
+        if uncompressed > MAX_OFFICE_UNCOMPRESSED_BYTES:
+            raise ValueError("office attachment uncompressed content is too large")
+        if uncompressed > compressed * MAX_OFFICE_COMPRESSION_RATIO:
+            raise ValueError("office attachment compression ratio is unsafe")
 
 
 def extract_legacy_doc(data: bytes) -> str:
@@ -889,11 +1183,12 @@ async def _download(
     validate_url: Callable[[str], Awaitable[None]],
     *,
     max_bytes: int = MAX_DOCUMENT_BYTES,
-) -> tuple[str, str, bytes]:
+    referer: str | None = None,
+) -> tuple[str, str, bytes, str | None]:
     """流式下载受限大小的公共资源，并再次校验重定向后的最终地址。"""
 
     await validate_url(url)
-    headers = {"User-Agent": "MetricPulse/1.0"}
+    headers = source_request_headers(url, referer=referer)
     if (urlparse(url).hostname or "").lower() == "api.github.com":
         headers.update(
             {
@@ -916,7 +1211,22 @@ async def _download(
             if len(content) > max_bytes:
                 raise ValueError(f"source exceeds {max_bytes} bytes")
     media_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
-    return final_url, media_type, bytes(content)
+    disposition = response.headers.get("content-disposition", "")
+    filename = None
+    if match := re.search(r"filename\*?=(?:UTF-8''|\")?([^\";]+)", disposition, re.I):
+        filename = Path(unquote(match.group(1).strip())).name[:255] or None
+    return final_url, media_type, bytes(content), filename
+
+
+def _unpack_download_result(
+    result: tuple[str, str, bytes] | tuple[str, str, bytes, str | None],
+) -> tuple[str, str, bytes, str | None]:
+    """兼容旧测试替身的三元组，生产返回额外的 Content-Disposition 文件名。"""
+
+    if len(result) == 3:
+        final_url, media_type, data = result
+        return final_url, media_type, data, None
+    return result
 
 
 async def _download_html_images(
@@ -928,11 +1238,14 @@ async def _download_html_images(
     images: list[ImageEvidence] = []
     for reference in references:
         try:
-            _, media_type, data = await _download(
-                client,
-                reference.url,
-                validate_url,
-                max_bytes=6_000_000,
+            _, media_type, data, _ = _unpack_download_result(
+                await _download(
+                    client,
+                    reference.url,
+                    validate_url,
+                    max_bytes=6_000_000,
+                    referer=reference.referer,
+                )
             )
         except httpx.HTTPError, ValueError:
             continue
@@ -963,6 +1276,8 @@ async def fetch_source_document(
     调用者可以据此决定浏览器降级或搜索降级，而无需用异常区分 HTTP、格式和解析错误。
     """
 
+    metadata = getattr(candidate, "metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
     document = SourceDocument(
         index=index,
         url=candidate.source_url,
@@ -970,15 +1285,53 @@ async def fetch_source_document(
         title=candidate.title,
         snippet=candidate.excerpt,
         normalized_url=normalize_source_url(candidate.source_url),
+        relation_type=str(metadata.get("relation_type") or "PRIMARY"),
+        parent_url=metadata.get("parent_url") if isinstance(metadata.get("parent_url"), str) else None,
+        attachment_filename=(
+            metadata.get("attachment_filename")
+            if isinstance(metadata.get("attachment_filename"), str)
+            else None
+        ),
+        attachment_anchor_text=(
+            metadata.get("attachment_anchor_text")
+            if isinstance(metadata.get("attachment_anchor_text"), str)
+            else None
+        ),
+        attachment_context=(
+            metadata.get("attachment_context")
+            if isinstance(metadata.get("attachment_context"), str)
+            else None
+        ),
     )
     try:
-        final_url, media_type, data = await _download(client, document.url, validate_url)
+        final_url, media_type, data, disposition_filename = _unpack_download_result(
+            await _download(
+                client,
+                document.url,
+                validate_url,
+                referer=document.parent_url,
+            )
+        )
         document.url = final_url
         document.media_type = media_type or "application/octet-stream"
         document.content_hash = hashlib.sha256(data).hexdigest()
+        document.content_bytes = len(data)
+        document.attachment_filename = document.attachment_filename or disposition_filename
         suffix = Path(urlparse(final_url).path).suffix.lower()
-        if media_type in {"text/html", "application/xhtml+xml"} or suffix in {".html", ".htm", ""}:
-            document.text, references = extract_html_main_content(data, final_url)
+        html_signature = data[:1_024].lstrip().lower()
+        is_html = bool(
+            media_type in {"text/html", "application/xhtml+xml"}
+            or suffix in {".html", ".htm"}
+            or (
+                media_type in {"", "application/octet-stream"}
+                and (html_signature.startswith(b"<!doctype html") or b"<html" in html_signature)
+            )
+        )
+        if is_html:
+            document.text, references, document.attachment_references = extract_html_main_content(
+                data,
+                final_url,
+            )
             document.images = await _download_html_images(client, references, index, validate_url)
             if looks_like_challenge_page(f"{final_url}\n{document.text}"):
                 document.url = document.requested_url or document.url
@@ -994,6 +1347,11 @@ async def fetch_source_document(
             document.text, document.images = extract_docx(data, index)
         elif media_type == "application/msword" or suffix == ".doc":
             document.text = extract_legacy_doc(data)
+        elif (
+            media_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            or suffix == ".xlsx"
+        ):
+            document.text = extract_xlsx(data)
         elif media_type.startswith("image/"):
             converted = normalize_image(data)
             if converted:
@@ -1011,6 +1369,8 @@ async def fetch_source_document(
             document.text = _normalize_text(_decode_text(data))
         else:
             document.error = f"unsupported content type: {media_type or suffix or 'unknown'}"
+        if not document.error and not (document.text or document.images):
+            document.error = "parsed content is empty"
     except httpx.HTTPStatusError as exc:
         document.http_status = exc.response.status_code
         retry_after = exc.response.headers.get("retry-after", "").strip()
@@ -1054,7 +1414,10 @@ async def _render_document_in_browser(
         final_url = page.url
         await validate_url(final_url)
         html_text = await page.content()
-        text, references = extract_html_main_content(html_text.encode("utf-8"), final_url)
+        text, references, attachment_references = extract_html_main_content(
+            html_text.encode("utf-8"),
+            final_url,
+        )
         title = await page.title()
         if looks_like_challenge_page(f"{final_url}\n{title}\n{text}") or looks_like_challenge_page(html_text):
             raise BrowserChallengeError("human-verification or access-challenge page detected")
@@ -1063,6 +1426,7 @@ async def _render_document_in_browser(
         document.title = document.title or title or None
         document.media_type = "text/html"
         document.text = text
+        document.attachment_references = attachment_references
         document.http_status = response.status if response is not None else None
         document.images = await _download_html_images(
             client,
@@ -1098,6 +1462,7 @@ async def _render_document_in_browser(
         if not document.text and not document.images:
             raise RuntimeError("browser rendered no usable main content")
         document.browser_rendered = True
+        document.request_profile = BROWSER_REQUEST_PROFILE
         document.error = None
     finally:
         await page.close()
@@ -1139,24 +1504,34 @@ async def apply_browser_fallbacks(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 f"(KHTML, like Gecko) Chrome/{chromium_version} Safari/537.36"
             )
+            settings = get_settings()
             context = await browser.new_context(
                 user_agent=user_agent,
                 locale="zh-CN",
                 timezone_id="Asia/Shanghai",
                 viewport={"width": 1440, "height": 1000},
+                screen={"width": 1440, "height": 1000},
+                device_scale_factor=1,
+                is_mobile=False,
+                has_touch=False,
                 color_scheme="light",
                 service_workers="block",
-                extra_http_headers={"Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7"},
+                extra_http_headers={"Accept-Language": settings.source_accept_language},
             )
+            validated_browser_origins: set[str] = set()
 
             async def route_request(route: Any) -> None:
                 request = route.request
                 if request.resource_type in {"font", "media", "websocket"}:
                     await route.abort()
                     return
-                if request.is_navigation_request():
+                parsed_request = urlparse(request.url)
+                if parsed_request.scheme in {"http", "https"}:
+                    origin = f"{parsed_request.scheme}://{parsed_request.netloc}"
                     try:
-                        await validate_url(request.url)
+                        if origin not in validated_browser_origins:
+                            await validate_url(request.url)
+                            validated_browser_origins.add(origin)
                     except ValueError:
                         await route.abort()
                         return
@@ -1208,6 +1583,10 @@ async def gather_source_documents(
     browser_settle_seconds: float = 5,
     browser_min_content_chars: int = 500,
     browser_site_cooldown_seconds: float = 30,
+    attachment_discovery_enabled: bool = True,
+    attachment_max_per_parent: int = 5,
+    attachment_max_per_unit: int = 8,
+    attachment_max_total_bytes: int = 50_000_000,
 ) -> list[SourceDocument]:
     """并发获取候选来源，同时按 URL 合并同源请求并维护两级缓存。
 
@@ -1292,6 +1671,72 @@ async def gather_source_documents(
                 min_content_chars=browser_min_content_chars,
                 site_cooldown_seconds=browser_site_cooldown_seconds,
             )
+        if attachment_discovery_enabled:
+            expanded: list[SourceDocument] = []
+            next_index = len(documents) + 1
+            downloaded_count = 0
+            downloaded_bytes = 0
+            for parent in list(documents):
+                expanded.append(parent)
+                for parent_position, reference in enumerate(parent.attachment_references, start=1):
+                    limit_reason = None
+                    if parent_position > attachment_max_per_parent:
+                        limit_reason = "ATTACHMENT_PARENT_LIMIT_EXCEEDED"
+                    elif downloaded_count >= attachment_max_per_unit:
+                        limit_reason = "ATTACHMENT_UNIT_LIMIT_EXCEEDED"
+                    elif downloaded_bytes >= attachment_max_total_bytes:
+                        limit_reason = "ATTACHMENT_TOTAL_BYTES_EXCEEDED"
+                    if not reference.supported or limit_reason:
+                        expanded.append(
+                            SourceDocument(
+                                index=next_index,
+                                url=reference.url,
+                                requested_url=reference.url,
+                                title=reference.anchor_text or reference.filename or "Attachment",
+                                snippet=reference.surrounding_text or None,
+                                error=reference.unsupported_reason or limit_reason,
+                                normalized_url=normalize_source_url(reference.url),
+                                relation_type="ATTACHMENT",
+                                parent_url=parent.url,
+                                attachment_filename=reference.filename,
+                                attachment_anchor_text=reference.anchor_text or None,
+                                attachment_context=reference.surrounding_text or None,
+                            )
+                        )
+                        next_index += 1
+                        continue
+                    candidate = SimpleNamespace(
+                        source_url=reference.url,
+                        title=reference.anchor_text or reference.filename or "Attachment",
+                        excerpt=reference.surrounding_text or None,
+                        metadata={
+                            "relation_type": "ATTACHMENT",
+                            "parent_url": parent.url,
+                            "attachment_filename": reference.filename,
+                            "attachment_anchor_text": reference.anchor_text,
+                            "attachment_context": reference.surrounding_text,
+                        },
+                    )
+                    attachment = await guarded(candidate, next_index)
+                    # 缓存快照按 URL 共享，父子关系则必须按当前行重建。
+                    attachment.relation_type = "ATTACHMENT"
+                    attachment.parent_url = parent.url
+                    attachment.attachment_filename = reference.filename
+                    attachment.attachment_anchor_text = reference.anchor_text or None
+                    attachment.attachment_context = reference.surrounding_text or None
+                    if (
+                        not attachment.error
+                        and downloaded_bytes + attachment.content_bytes > attachment_max_total_bytes
+                    ):
+                        attachment.text = ""
+                        attachment.images = []
+                        attachment.error = "ATTACHMENT_TOTAL_BYTES_EXCEEDED"
+                    else:
+                        downloaded_bytes += attachment.content_bytes
+                        downloaded_count += 1
+                    expanded.append(attachment)
+                    next_index += 1
+            documents = expanded
         for document in documents:
             cache_key = (
                 document.cache_key

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import io
+import zipfile
 from types import SimpleNamespace
 
 import pymupdf
+import pytest
 from docx import Document
+from openpyxl import Workbook
 from PIL import Image
 
 from metric_pulse.source_pipeline import (
+    AttachmentReference,
     ImageEvidence,
     ImageReference,
     SourceDocument,
@@ -17,20 +21,24 @@ from metric_pulse.source_pipeline import (
     extract_docx,
     extract_html_main_content,
     extract_pdf,
+    extract_xlsx,
     fetch_source_document,
     gather_source_documents,
     looks_like_challenge_page,
     normalize_source_url,
+    source_request_headers,
+    validate_office_archive,
 )
 
 
 def test_html_extraction_keeps_main_content_and_drops_boilerplate() -> None:
-    text, images = extract_html_main_content(
+    text, images, attachments = extract_html_main_content(
         b"""
         <html><body>
           <nav>unrelated navigation</nav>
           <main><h1>AI report</h1><p>Sweden created 42 AI companies in 2025.</p>
           <img src="/chart.png" alt="AI companies chart" width="800" height="500">
+          <a href="/appendix.pdf">Download appendix</a>
           <img src="/logo.png" alt="logo" width="100" height="50"></main>
           <footer>unrelated footer</footer>
         </body></html>
@@ -47,8 +55,43 @@ def test_html_extraction_keeps_main_content_and_drops_boilerplate() -> None:
             url="https://example.com/chart.png",
             description=("alt: AI companies chart | 邻近正文: Sweden created 42 AI companies in 2025."),
             marker="[[METRIC_PULSE_IMAGE:1]]",
+            referer="https://example.com/report",
         )
     ]
+    assert attachments == [
+        AttachmentReference(
+            url="https://example.com/appendix.pdf",
+            parent_url="https://example.com/report",
+            anchor_text="Download appendix",
+            surrounding_text="Download appendix",
+            filename="appendix.pdf",
+        )
+    ]
+
+
+def test_attachment_discovery_is_limited_to_main_and_marks_unsupported_formats() -> None:
+    _, _, attachments = extract_html_main_content(
+        b"""
+        <html><body>
+          <nav><a href="/nav.pdf">navigation download</a></nav>
+          <main>
+            <p>Official tables <a href="files/data.xlsx">data workbook</a></p>
+            <p><a href="/slides.pptx">download slides</a></p>
+            <a href="/about">ordinary page</a>
+          </main>
+          <footer><a href="/footer.zip">footer archive</a></footer>
+        </body></html>
+        """,
+        "https://example.com/reports/2025",
+    )
+
+    assert [item.url for item in attachments] == [
+        "https://example.com/reports/files/data.xlsx",
+        "https://example.com/slides.pptx",
+    ]
+    assert attachments[0].supported is True
+    assert attachments[1].supported is False
+    assert attachments[1].unsupported_reason == "unsupported attachment format: .pptx"
 
 
 def test_world_bank_page_is_normalized_to_official_structured_api() -> None:
@@ -94,6 +137,154 @@ def test_github_api_keeps_raw_json_for_dedicated_ranking_parser(monkeypatch) -> 
     assert '"items"' in document.text
 
 
+def test_gather_expands_main_attachment_as_independent_source(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    import metric_pulse.source_pipeline as pipeline
+
+    pipeline._SOURCE_CACHE.clear()
+    pipeline._SOURCE_CACHE_LOCKS.clear()
+    settings = pipeline.get_settings()
+    monkeypatch.setattr(settings, "source_cache_root", tmp_path)
+    monkeypatch.setattr(settings, "source_host_min_interval_seconds", 0)
+    requests: list[tuple[str, str | None]] = []
+
+    async def fake_download(_client, url, _validate_url, **kwargs):
+        requests.append((url, kwargs.get("referer")))
+        if url == "https://example.com/report":
+            return (
+                url,
+                "text/html",
+                b'<main><h1>Annual report</h1><p><a href="/data.csv">Download data</a></p></main>',
+            )
+        return url, "text/csv", b"country,value\nSweden,456"
+
+    async def allow(_url):
+        return None
+
+    monkeypatch.setattr(pipeline, "_download", fake_download)
+    candidate = SimpleNamespace(
+        source_url="https://example.com/report",
+        title="Report",
+        excerpt=None,
+        metadata={},
+    )
+
+    documents = asyncio.run(
+        gather_source_documents(
+            [candidate],
+            allow,
+            browser_fallback_enabled=False,
+            attachment_max_per_parent=5,
+            attachment_max_per_unit=8,
+        )
+    )
+
+    assert len(documents) == 2
+    assert documents[0].relation_type == "PRIMARY"
+    assert documents[1].relation_type == "ATTACHMENT"
+    assert documents[1].parent_url == "https://example.com/report"
+    assert documents[1].attachment_filename == "data.csv"
+    assert "Sweden,456" in documents[1].text
+    assert requests[-1] == ("https://example.com/data.csv", "https://example.com/report")
+
+
+def test_attachment_failure_isolated_from_usable_parent(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    import metric_pulse.source_pipeline as pipeline
+
+    pipeline._SOURCE_CACHE.clear()
+    pipeline._SOURCE_CACHE_LOCKS.clear()
+    settings = pipeline.get_settings()
+    monkeypatch.setattr(settings, "source_cache_root", tmp_path)
+    monkeypatch.setattr(settings, "source_host_min_interval_seconds", 0)
+
+    async def fake_download(_client, url, _validate_url, **_kwargs):
+        assert url == "https://example.com/report"
+        return (
+            url,
+            "text/html",
+            b'<main><p>Usable parent value 42.</p><a href="/archive.zip">Download archive</a></main>',
+        )
+
+    async def allow(_url):
+        return None
+
+    monkeypatch.setattr(pipeline, "_download", fake_download)
+    candidate = SimpleNamespace(
+        source_url="https://example.com/report",
+        title="Report",
+        excerpt=None,
+        metadata={},
+    )
+
+    documents = asyncio.run(
+        gather_source_documents([candidate], allow, browser_fallback_enabled=False)
+    )
+
+    assert "Usable parent value 42." in documents[0].text
+    assert documents[1].relation_type == "ATTACHMENT"
+    assert documents[1].error == "unsupported attachment format: .zip"
+
+
+def test_attachment_limits_are_audited_and_nested_links_are_not_followed(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    import metric_pulse.source_pipeline as pipeline
+
+    pipeline._SOURCE_CACHE.clear()
+    pipeline._SOURCE_CACHE_LOCKS.clear()
+    settings = pipeline.get_settings()
+    monkeypatch.setattr(settings, "source_cache_root", tmp_path)
+    monkeypatch.setattr(settings, "source_host_min_interval_seconds", 0)
+    requested: list[str] = []
+
+    async def fake_download(_client, url, _validate_url, **_kwargs):
+        requested.append(url)
+        if url == "https://example.com/report":
+            return (
+                url,
+                "text/html",
+                b"""<main><p>Parent</p>
+                <a href="/first">Download first</a>
+                <a href="/second.pdf">Download second</a></main>""",
+            )
+        assert url == "https://example.com/first"
+        return (
+            url,
+            "text/html",
+            b'<main><p>Nested attachment body 123</p><a href="/nested.pdf">Download nested</a></main>',
+        )
+
+    async def allow(_url):
+        return None
+
+    monkeypatch.setattr(pipeline, "_download", fake_download)
+    candidate = SimpleNamespace(
+        source_url="https://example.com/report",
+        title="Report",
+        excerpt=None,
+        metadata={},
+    )
+
+    documents = asyncio.run(
+        gather_source_documents(
+            [candidate],
+            allow,
+            browser_fallback_enabled=False,
+            attachment_max_per_parent=1,
+            attachment_max_per_unit=8,
+        )
+    )
+
+    assert requested == ["https://example.com/report", "https://example.com/first"]
+    assert len(documents) == 3
+    assert "Nested attachment body 123" in documents[1].text
+    assert documents[2].error == "ATTACHMENT_PARENT_LIMIT_EXCEEDED"
+    assert all(document.url != "https://example.com/nested.pdf" for document in documents)
+
+
 def test_pdf_extraction_includes_text_and_rendered_page() -> None:
     document = pymupdf.open()
     page = document.new_page()
@@ -107,6 +298,37 @@ def test_pdf_extraction_includes_text_and_rendered_page() -> None:
     assert images
     assert images[0].source_index == 2
     assert images[0].png.startswith(b"\x89PNG")
+
+
+def test_extensionless_pdf_uses_content_type_instead_of_html_branch(monkeypatch) -> None:
+    import asyncio
+
+    import metric_pulse.source_pipeline as pipeline
+
+    pdf = pymupdf.open()
+    pdf.new_page().insert_text((72, 72), "Attachment value 789")
+    payload = pdf.tobytes()
+    pdf.close()
+
+    async def fake_download(_client, url, _validate_url, **_kwargs):
+        return url, "application/pdf", payload, "official-report.pdf"
+
+    async def allow(_url):
+        return None
+
+    monkeypatch.setattr(pipeline, "_download", fake_download)
+    candidate = SimpleNamespace(
+        source_url="https://example.com/download?id=42",
+        title="Official report",
+        excerpt=None,
+        metadata={"relation_type": "ATTACHMENT"},
+    )
+
+    document = asyncio.run(fetch_source_document(candidate, 2, object(), allow))
+
+    assert document.media_type == "application/pdf"
+    assert document.attachment_filename == "official-report.pdf"
+    assert "789" in document.text
 
 
 def test_docx_extraction_includes_paragraphs_and_tables() -> None:
@@ -124,6 +346,43 @@ def test_docx_extraction_includes_paragraphs_and_tables() -> None:
 
     assert "AI talent report" in text
     assert "Sweden\t456" in text
+
+
+def test_xlsx_extraction_includes_sheet_names_and_formula_results() -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Indicators"
+    sheet.append(["Country", "Value"])
+    sheet.append(["Sweden", 456])
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+
+    text = extract_xlsx(buffer.getvalue())
+
+    assert "Sheet: Indicators" in text
+    assert "Country\tValue" in text
+    assert "Sweden\t456" in text
+
+
+def test_office_attachment_rejects_unsafe_compression_ratio() -> None:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("xl/worksheets/sheet1.xml", b"0" * 2_000_000)
+
+    with pytest.raises(ValueError, match="compression ratio is unsafe"):
+        validate_office_archive(buffer.getvalue())
+
+
+def test_http_request_profile_is_browser_coherent_without_forged_client_hints() -> None:
+    headers = source_request_headers(
+        "https://cdn.example.net/report.pdf",
+        referer="https://example.com/report?access_token=secret#download",
+    )
+
+    assert headers["User-Agent"].startswith("Mozilla/5.0")
+    assert headers["Accept-Language"].startswith("zh-CN")
+    assert headers["Referer"] == "https://example.com/"
+    assert not any(key.lower().startswith(("sec-fetch", "sec-ch-ua")) for key in headers)
 
 
 def test_contact_sheet_combines_visual_evidence() -> None:
