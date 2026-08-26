@@ -89,11 +89,13 @@ class SourceCooldownError(RuntimeError):
         retry_after_seconds: float,
         failure_count: int = 1,
         deferred: bool = True,
+        acquisition_attempt: dict[str, Any] | None = None,
     ) -> None:
         self.category = category
         self.retry_after_seconds = max(1.0, retry_after_seconds)
         self.failure_count = max(1, failure_count)
         self.deferred = deferred
+        self.acquisition_attempt = acquisition_attempt
         super().__init__(
             f"source cooldown active: {category}; retry after {self.retry_after_seconds:.0f}s"
         )
@@ -105,7 +107,11 @@ class Collector(Protocol):
     async def collect(self, record: DataRecord, unit: CollectionUnit) -> CollectionResult: ...
 
 
-def raise_for_source_cooldown(documents: list[SourceDocument]) -> None:
+def raise_for_source_cooldown(
+    documents: list[SourceDocument],
+    *,
+    started_at: datetime | None = None,
+) -> None:
     active = [
         document
         for document in documents
@@ -116,11 +122,46 @@ def raise_for_source_cooldown(documents: list[SourceDocument]) -> None:
     if not active:
         return
     document = max(active, key=lambda item: item.source_cooldown_until or 0)
+    deferred = (document.error or "").startswith("source cooldown active:")
+    ended_at = datetime.now(UTC)
+    retry_after_seconds = (document.source_cooldown_until or time.time()) - time.time()
+    acquisition_attempt = {
+        "route": "DIRECT_LINK",
+        "status": "DEFERRED" if deferred else "FAILED",
+        "reason": "SOURCE_COOLDOWN_ACTIVE" if deferred else "DIRECT_FETCH_FAILED",
+        "input_url": document.requested_url or document.url,
+        "normalized_url": document.normalized_url,
+        "final_url": document.url,
+        "content_hash": document.content_hash,
+        "cache_hit": document.cache_hit,
+        "persistent_cache_hit": document.persistent_cache_hit,
+        "match_status": "SOURCE_COOLDOWN" if deferred else "FETCH_FAILED",
+        "match_count": 0,
+        "source_failure_category": document.source_failure_category or "TRANSIENT",
+        "source_failure_count": document.source_failure_count,
+        "retry_after_seconds": max(1.0, retry_after_seconds),
+        "source_contexts": [
+            {
+                "requested_url": document.requested_url,
+                "normalized_url": document.normalized_url,
+                "final_url": document.url,
+                "content_hash": document.content_hash,
+                "cache_hit": document.cache_hit,
+                "persistent_cache_hit": document.persistent_cache_hit,
+                "media_type": document.media_type,
+                "request_profile": document.request_profile,
+                "fetch_error": document.error,
+            }
+        ],
+        "started_at": started_at or ended_at,
+        "ended_at": ended_at,
+    }
     raise SourceCooldownError(
         category=document.source_failure_category or "TRANSIENT",
-        retry_after_seconds=(document.source_cooldown_until or time.time()) - time.time(),
+        retry_after_seconds=retry_after_seconds,
         failure_count=document.source_failure_count,
-        deferred=(document.error or "").startswith("source cooldown active:"),
+        deferred=deferred,
+        acquisition_attempt=acquisition_attempt,
     )
 
 
@@ -1386,7 +1427,7 @@ class OMLXCollector:
                     )
                 ]
             )
-            raise_for_source_cooldown(direct_documents)
+            raise_for_source_cooldown(direct_documents, started_at=acquisition_started_at)
             try:
                 ranked_document, profile_deterministic_values = prepare_github_rank_document(
                     direct_documents[0],
@@ -1422,7 +1463,7 @@ class OMLXCollector:
                     )
                 ]
             )
-            raise_for_source_cooldown(direct_documents)
+            raise_for_source_cooldown(direct_documents, started_at=acquisition_started_at)
             try:
                 company_document, profile_deterministic_values = prepare_forbes_ai50_company_document(
                     direct_documents[0],
@@ -1453,7 +1494,7 @@ class OMLXCollector:
                     )
                 ]
             )
-            raise_for_source_cooldown(direct_documents)
+            raise_for_source_cooldown(direct_documents, started_at=acquisition_started_at)
             direct_succeeded, fallback_reason, match_metadata = evaluate_direct_documents(
                 direct_documents,
                 descriptors,

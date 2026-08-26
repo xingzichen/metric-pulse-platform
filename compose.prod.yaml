@@ -1,8 +1,12 @@
 name: metric-pulse
 
 # 生产编排只拉取已经发布的镜像，不在服务器上重复构建源代码。
-# MP_IMAGE_TAG 默认固定为正式版本 1.1.1；升级或回滚时可临时指定其他不可变版本。
-x-app-image: &app-image ghcr.io/xingzichen/metric-pulse-platform-api:${MP_IMAGE_TAG:-1.1.1}
+# MP_IMAGE_TAG 默认固定为正式版本 1.1.2；升级或回滚时可临时指定其他不可变版本。
+x-app-image: &app-image ghcr.io/xingzichen/metric-pulse-platform-api:${MP_IMAGE_TAG:-1.1.2}
+x-source-dns: &source-dns
+  # 采集进程必须拿到真实公网 IP，避免路由器/Clash Fake-IP 被 SSRF 门禁正确拒绝。
+  - 223.5.5.5
+  - 119.29.29.29
 
 services:
   postgres:
@@ -93,6 +97,7 @@ services:
   api:
     image: *app-image
     restart: unless-stopped
+    dns: *source-dns
     environment: *app-env
     volumes: *app-volumes
     depends_on:
@@ -108,6 +113,7 @@ services:
     image: *app-image
     command: ["metric-pulse-worker"]
     restart: unless-stopped
+    dns: *source-dns
     environment: *app-env
     volumes: *app-volumes
     depends_on:
@@ -115,7 +121,7 @@ services:
       redis: { condition: service_healthy }
 
   web:
-    image: ghcr.io/xingzichen/metric-pulse-platform-web:${MP_IMAGE_TAG:-1.1.1}
+    image: ghcr.io/xingzichen/metric-pulse-platform-web:${MP_IMAGE_TAG:-1.1.2}
     restart: unless-stopped
     ports:
       - "${MP_WEB_PORT:-8080}:80"

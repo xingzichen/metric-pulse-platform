@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+from datetime import UTC, datetime
 
 import pytest
 
@@ -10,6 +11,7 @@ from metric_pulse.collector import (
     CollectionResult,
     EvidenceItem,
     OMLXCollector,
+    SourceCooldownError,
     _normalize_image_table_response,
     apply_ai_index_conversion,
     apply_source_provenance,
@@ -20,6 +22,7 @@ from metric_pulse.collector import (
     evidence_from_documents,
     extract_structured_values,
     focus_evidence,
+    raise_for_source_cooldown,
     render_search_evidence,
     render_source_documents,
     structured_match_diagnostics,
@@ -41,6 +44,31 @@ from metric_pulse.source_pipeline import ImageEvidence, SourceDocument
 def _address(ip: str, port: int = 443):
     family = socket.AF_INET6 if ":" in ip else socket.AF_INET
     return (family, socket.SOCK_STREAM, 6, "", (ip, port))
+
+
+def test_source_cooldown_exception_carries_failed_acquisition_audit() -> None:
+    started_at = datetime.now(UTC)
+    document = SourceDocument(
+        index=1,
+        url="https://example.com/report",
+        requested_url="https://example.com/report",
+        normalized_url="https://example.com/report",
+        error="browser fallback failed: net::ERR_FAILED",
+        source_cooldown_until=10**12,
+        source_failure_category="TRANSIENT",
+        source_failure_count=3,
+    )
+
+    with pytest.raises(SourceCooldownError) as caught:
+        raise_for_source_cooldown([document], started_at=started_at)
+
+    error = caught.value
+    assert error.deferred is False
+    assert error.acquisition_attempt is not None
+    assert error.acquisition_attempt["status"] == "FAILED"
+    assert error.acquisition_attempt["reason"] == "DIRECT_FETCH_FAILED"
+    assert error.acquisition_attempt["source_contexts"][0]["fetch_error"] == document.error
+    assert error.acquisition_attempt["started_at"] == started_at
 
 
 def test_ai_index_program_conversion_overrides_model_data_candidate() -> None:

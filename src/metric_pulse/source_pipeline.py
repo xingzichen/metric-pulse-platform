@@ -825,6 +825,10 @@ def looks_like_challenge_page(text: str) -> bool:
 
 def browser_fallback_reason(document: SourceDocument, *, min_content_chars: int) -> str | None:
     """判断是否需要浏览器重试，并返回可审计原因；附件类型不走浏览器。"""
+    if document.error and _is_permanent_source_error(document.error):
+        # SSRF/安全门禁及确定性格式失败不是浏览器能修复的网络问题。继续回退
+        # 会覆盖真实错误，并把安全拒绝误写成 TRANSIENT 负缓存。
+        return None
     if document.error and document.error.startswith("source cooldown active:"):
         return None
     if (urlparse(document.url).hostname or "").lower() == "api.github.com":
@@ -1540,6 +1544,7 @@ async def apply_browser_fallbacks(
             await context.route("**/*", route_request)
             try:
                 for document in pending:
+                    original_error = document.error
                     hostname = urlparse(document.url).hostname or ""
                     earliest = last_visit_started.get(hostname, 0) + site_cooldown_seconds
                     delay = max(0.0, earliest - time.monotonic())
@@ -1560,17 +1565,26 @@ async def apply_browser_fallbacks(
                         document.url = document.requested_url or document.url
                         document.text = ""
                         document.images = []
-                        document.error = f"browser fallback stopped: {exc}"
+                        browser_error = f"browser fallback stopped: {exc}"
+                        document.error = (
+                            f"{original_error}; {browser_error}" if original_error else browser_error
+                        )
                     except Exception as exc:
                         document.url = document.requested_url or document.url
-                        document.error = f"browser fallback failed: {exc}"
+                        browser_error = f"browser fallback failed: {exc}"
+                        document.error = (
+                            f"{original_error}; {browser_error}" if original_error else browser_error
+                        )
             finally:
                 await context.close()
                 await browser.close()
     except Exception as exc:
         for document in pending:
             if not document.browser_rendered:
-                document.error = f"browser fallback unavailable: {exc}"
+                browser_error = f"browser fallback unavailable: {exc}"
+                document.error = (
+                    f"{document.error}; {browser_error}" if document.error else browser_error
+                )
 
 
 async def gather_source_documents(

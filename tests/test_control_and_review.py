@@ -31,6 +31,7 @@ from metric_pulse.models import (
     ReviewStatus,
     RiskLevel,
     RowSearchAttempt,
+    SourceAcquisitionAttempt,
     TaskStatus,
     UnitSourceLink,
     UnitStatus,
@@ -834,6 +835,19 @@ def test_deferred_source_cooldown_does_not_consume_unit_retry(client) -> None:
                 retry_after_seconds=240,
                 failure_count=2,
                 deferred=True,
+                acquisition_attempt={
+                    "route": "DIRECT_LINK",
+                    "status": "DEFERRED",
+                    "reason": "SOURCE_COOLDOWN_ACTIVE",
+                    "input_url": "https://example.com/report",
+                    "normalized_url": "https://example.com/report",
+                    "match_status": "SOURCE_COOLDOWN",
+                    "match_count": 0,
+                    "retry_after_seconds": 240,
+                    "source_failure_count": 2,
+                    "started_at": datetime.now(UTC),
+                    "ended_at": datetime.now(UTC),
+                },
             )
 
     db, _, task, unit = _task_with_unit(
@@ -858,10 +872,19 @@ def test_deferred_source_cooldown_does_not_consume_unit_retry(client) -> None:
         .order_by(CollectionAttempt.started_at.desc())
     )
     assert attempt is not None and attempt.status == "DEFERRED"
+    acquisition = db.scalar(
+        select(SourceAcquisitionAttempt)
+        .where(SourceAcquisitionAttempt.unit_id == unit.id)
+        .order_by(SourceAcquisitionAttempt.started_at.desc())
+    )
+    assert acquisition is not None
+    assert acquisition.status == "DEFERRED"
+    assert acquisition.reason == "SOURCE_COOLDOWN_ACTIVE"
+    assert acquisition.details["source_failure_count"] == 2
     db.close()
 
 
-def test_exhausted_shared_source_cooldown_routes_unit_to_manual_review(client) -> None:
+def test_exhausted_shared_source_cooldown_remains_deferred_for_current_unit(client) -> None:
     class ExhaustedCoolingDownCollector:
         async def collect(self, _record, _unit):
             raise SourceCooldownError(
@@ -882,10 +905,10 @@ def test_exhausted_shared_source_cooldown_routes_unit_to_manual_review(client) -
 
     db.refresh(task)
     db.refresh(unit)
-    assert task.status == TaskStatus.SUCCEEDED_WITH_ERRORS
-    assert unit.status == UnitStatus.FAILED_FINAL
+    assert task.status == TaskStatus.RUNNING
+    assert unit.status == UnitStatus.FAILED_RETRYABLE
     assert unit.attempt_count == 1
-    assert unit.next_attempt_at is None
+    assert unit.next_attempt_at is not None
     attempt = db.scalar(
         select(CollectionAttempt)
         .where(CollectionAttempt.unit_id == unit.id)

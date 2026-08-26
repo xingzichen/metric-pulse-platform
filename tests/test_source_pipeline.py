@@ -426,11 +426,17 @@ def test_browser_fallback_targets_blocked_or_javascript_thin_pages() -> None:
         http_status=429,
         error="HTTP 429: Too Many Requests",
     )
+    security_rejection = SourceDocument(
+        index=5,
+        url="https://example.com/private-redirect",
+        error="Private, loopback, and reserved evidence addresses are not allowed",
+    )
 
     assert browser_fallback_reason(blocked, min_content_chars=500) == "HTTP 403"
     assert "shorter than 500" in (browser_fallback_reason(thin, min_content_chars=500) or "")
     assert browser_fallback_reason(binary, min_content_chars=500) is None
     assert browser_fallback_reason(github_api, min_content_chars=500) is None
+    assert browser_fallback_reason(security_rejection, min_content_chars=500) is None
 
 
 def test_challenge_detection_does_not_flag_long_normal_article() -> None:
@@ -636,12 +642,8 @@ def test_security_policy_rejection_is_not_negative_cached(monkeypatch, tmp_path)
         excerpt=None,
     )
 
-    first = asyncio.run(
-        gather_source_documents([candidate], allow, browser_fallback_enabled=False)
-    )
-    second = asyncio.run(
-        gather_source_documents([candidate], allow, browser_fallback_enabled=False)
-    )
+    first = asyncio.run(gather_source_documents([candidate], allow, browser_fallback_enabled=True))
+    second = asyncio.run(gather_source_documents([candidate], allow, browser_fallback_enabled=True))
 
     assert fetches == 2
     assert first[0].source_cooldown_until is None

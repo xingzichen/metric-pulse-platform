@@ -47,6 +47,57 @@ def _normalized_url(value: str) -> str:
     return urlunsplit((parts.scheme.lower(), netloc, parts.path or "/", parts.query, ""))
 
 
+def persist_source_acquisition_attempt(
+    db: Session,
+    unit: CollectionUnit,
+    item: dict,
+    *,
+    search_attempt_id: str | None = None,
+) -> None:
+    """持久化单次来源获取，包括在采集器返回结果前抛出的冷却/失败审计。"""
+
+    details = {
+        key: value
+        for key, value in item.items()
+        if key
+        not in {
+            "route",
+            "status",
+            "reason",
+            "input_url",
+            "normalized_url",
+            "final_url",
+            "content_hash",
+            "cache_hit",
+            "persistent_cache_hit",
+            "match_status",
+            "match_count",
+            "started_at",
+            "ended_at",
+        }
+    }
+    db.add(
+        SourceAcquisitionAttempt(
+            unit_id=unit.id,
+            search_attempt_id=search_attempt_id,
+            route=item["route"],
+            status=item.get("status", "SUCCEEDED"),
+            reason=item.get("reason"),
+            input_url=item.get("input_url"),
+            normalized_url=item.get("normalized_url"),
+            final_url=item.get("final_url"),
+            content_hash=item.get("content_hash"),
+            cache_hit=item.get("cache_hit") is True,
+            persistent_cache_hit=item.get("persistent_cache_hit") is True,
+            match_status=item.get("match_status"),
+            match_count=item.get("match_count", 0),
+            details=details,
+            started_at=item.get("started_at", datetime.now(UTC)),
+            ended_at=item.get("ended_at"),
+        )
+    )
+
+
 def persist_collection_audit(db: Session, unit: CollectionUnit, result) -> None:
     """把采集器返回的非业务值元数据写入规范化审计表。
 
@@ -73,46 +124,11 @@ def persist_collection_audit(db: Session, unit: CollectionUnit, result) -> None:
         db.add(search_attempt)
         db.flush()
     if result.acquisition_attempt:
-        item = result.acquisition_attempt
-        details = {
-            key: value
-            for key, value in item.items()
-            if key
-            not in {
-                "route",
-                "status",
-                "reason",
-                "input_url",
-                "normalized_url",
-                "final_url",
-                "content_hash",
-                "cache_hit",
-                "persistent_cache_hit",
-                "match_status",
-                "match_count",
-                "started_at",
-                "ended_at",
-            }
-        }
-        db.add(
-            SourceAcquisitionAttempt(
-                unit_id=unit.id,
-                search_attempt_id=search_attempt.id if search_attempt else None,
-                route=item["route"],
-                status=item.get("status", "SUCCEEDED"),
-                reason=item.get("reason"),
-                input_url=item.get("input_url"),
-                normalized_url=item.get("normalized_url"),
-                final_url=item.get("final_url"),
-                content_hash=item.get("content_hash"),
-                cache_hit=item.get("cache_hit") is True,
-                persistent_cache_hit=item.get("persistent_cache_hit") is True,
-                match_status=item.get("match_status"),
-                match_count=item.get("match_count", 0),
-                details=details,
-                started_at=item.get("started_at", datetime.now(UTC)),
-                ended_at=item.get("ended_at"),
-            )
+        persist_source_acquisition_attempt(
+            db,
+            unit,
+            result.acquisition_attempt,
+            search_attempt_id=search_attempt.id if search_attempt else None,
         )
     for item in result.model_calls:
         db.add(
@@ -364,14 +380,17 @@ class TaskProcessor:
                 infrastructure_failure = isinstance(exc, PermissionError)
                 source_cooldown = isinstance(exc, SourceCooldownError)
                 if source_cooldown:
-                    # 命中已有共享冷却并未发起新请求时，不消耗单元重试次数；
-                    # 同一来源的真实失败达到三次后才转人工，避免无限冷却循环。
+                    if exc.acquisition_attempt:
+                        persist_source_acquisition_attempt(db, unit, exc.acquisition_attempt)
+                    # 命中已有共享冷却并未发起新请求时，不消耗单元重试次数，也不能
+                    # 仅凭共享 URL 的失败次数把当前行转为最终失败。只有本单元真实发起请求并
+                    # 耗尽自身三次尝试时才转人工。
                     if exc.deferred:
                         unit.attempt_count = max(0, unit.attempt_count - 1)
                     unit.status = (
-                        UnitStatus.FAILED_FINAL
-                        if exc.failure_count >= 3
-                        else UnitStatus.FAILED_RETRYABLE
+                        UnitStatus.FAILED_RETRYABLE
+                        if exc.deferred or unit.attempt_count < 3
+                        else UnitStatus.FAILED_FINAL
                     )
                 else:
                     unit.status = (
