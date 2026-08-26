@@ -177,7 +177,10 @@ class OMLXClient:
                         raise TypeError(
                             f"non-text structured content ({type(content).__name__})"
                         )
-                    normalized_content = JSON_FENCE.sub("", content).strip()
+                    # Some OpenAI-compatible Qwen templates indent or prepend a blank line before a
+                    # Markdown JSON fence. Strip outer whitespace before removing the fence so an
+                    # otherwise valid object is not rejected at character zero.
+                    normalized_content = JSON_FENCE.sub("", content.strip()).strip()
                     parsed = json.loads(normalized_content)
                     # 兼容本地多模态模板的两种无害包装：单元素数组和“字符串中的 JSON”。最多展开
                     # 两层，避免递归解析任意模型输出；展开后仍必须是对象。
@@ -216,6 +219,20 @@ class OMLXClient:
                         }
                     )
                     if attempt < maximum_attempts:
+                        # Replaying the identical temperature-zero request produces the identical
+                        # malformed response on deterministic local models. Change the retry prompt
+                        # without echoing the invalid (and potentially source-derived) content.
+                        payload["messages"] = [
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": user_content},
+                            {
+                                "role": "user",
+                                "content": (
+                                    "Protocol correction: return exactly one raw JSON object. "
+                                    "Do not use Markdown fences, analysis, commentary, or a JSON string."
+                                ),
+                            },
+                        ]
                         continue
                     raise OMLXError(
                         f"OMLX returned invalid JSON/protocol content ({diagnostic}): {exc}"

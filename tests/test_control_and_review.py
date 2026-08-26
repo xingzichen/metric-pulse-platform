@@ -7,7 +7,7 @@ import pytest
 from sqlalchemy import select
 
 from metric_pulse import main as main_module
-from metric_pulse.collector import CollectionResult, EvidenceItem
+from metric_pulse.collector import CollectionResult, EvidenceItem, SourceCooldownError
 from metric_pulse.dataset_profiles import (
     AI_ALGORITHM_COLLECTION_TARGET_FIELDS,
     FORBES_AI50_SOURCE_URL,
@@ -823,6 +823,30 @@ def test_permission_error_pauses_task_without_exhausting_unit_retries(client) ->
     assert unit.attempt_count == 1
     assert unit.next_attempt_at is not None
     assert "/data/source-cache/locks" in unit.error
+    db.close()
+
+
+def test_source_cooldown_never_turns_a_unit_into_final_failure(client) -> None:
+    class CoolingDownCollector:
+        async def collect(self, _record, _unit):
+            raise SourceCooldownError(category="TRANSIENT", retry_after_seconds=240)
+
+    db, _, task, unit = _task_with_unit(
+        task_status=TaskStatus.QUEUED,
+        unit_status=UnitStatus.FAILED_RETRYABLE,
+    )
+    unit.attempt_count = 2
+    db.commit()
+
+    asyncio.run(TaskProcessor(CoolingDownCollector()).process(db, task.id, max_units=1))
+
+    db.refresh(task)
+    db.refresh(unit)
+    assert task.status == TaskStatus.RUNNING
+    assert unit.status == UnitStatus.FAILED_RETRYABLE
+    assert unit.attempt_count == 3
+    assert unit.next_attempt_at is not None
+    assert (unit.next_attempt_at - datetime.now(UTC).replace(tzinfo=None)).total_seconds() > 200
     db.close()
 
 

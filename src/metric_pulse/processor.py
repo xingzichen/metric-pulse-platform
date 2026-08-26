@@ -362,9 +362,10 @@ class TaskProcessor:
             except Exception as exc:  # worker 边界统一记录并隔离提供方、解析和持久化异常
                 unit.error = str(exc)
                 infrastructure_failure = isinstance(exc, PermissionError)
+                source_cooldown = isinstance(exc, SourceCooldownError)
                 unit.status = (
                     UnitStatus.FAILED_RETRYABLE
-                    if infrastructure_failure or unit.attempt_count < 3
+                    if infrastructure_failure or source_cooldown or unit.attempt_count < 3
                     else UnitStatus.FAILED_FINAL
                 )
                 attempt.status = "FAILED"

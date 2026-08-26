@@ -165,6 +165,81 @@ def test_generate_json_retries_empty_protocol_response_once(monkeypatch) -> None
     assert client.last_response_metadata["protocol_retries"] == 1
 
 
+def test_generate_json_accepts_indented_markdown_json_fence(monkeypatch) -> None:
+    class FakeResponse:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {
+                "choices": [
+                    {
+                        "message": {"content": "  \n```json\n{\"ok\": true}\n```\n  "},
+                        "finish_reason": "stop",
+                    }
+                ]
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def post(self, _url, *, headers, json):
+            return FakeResponse()
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    client = OMLXClient(Settings(vision_analysis_enabled=False))
+
+    result = asyncio.run(client.generate_json(system="json", prompt="value"))
+
+    assert result == {"ok": True}
+
+
+def test_generate_json_changes_deterministic_protocol_retry_prompt(monkeypatch) -> None:
+    request_messages: list[list[dict]] = []
+
+    class FakeResponse:
+        def __init__(self, content: str) -> None:
+            self.content = content
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return {"choices": [{"message": {"content": self.content}, "finish_reason": "stop"}]}
+
+    class FakeAsyncClient:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+        async def post(self, _url, *, headers, json):
+            request_messages.append([dict(message) for message in json["messages"]])
+            return FakeResponse("not-json" if len(request_messages) == 1 else '{"ok":true}')
+
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+    client = OMLXClient(Settings(vision_analysis_enabled=False, omlx_json_retry_attempts=1))
+
+    result = asyncio.run(client.generate_json(system="json", prompt="value"))
+
+    assert result == {"ok": True}
+    assert len(request_messages[0]) == 2
+    assert len(request_messages[1]) == 3
+    assert "Protocol correction" in request_messages[1][-1]["content"]
+    assert "not-json" not in str(request_messages[1])
+
+
 def test_generate_json_reports_safe_diagnostics_after_empty_retries(monkeypatch) -> None:
     class FakeResponse:
         def raise_for_status(self) -> None:
