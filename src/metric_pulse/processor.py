@@ -363,12 +363,23 @@ class TaskProcessor:
                 unit.error = str(exc)
                 infrastructure_failure = isinstance(exc, PermissionError)
                 source_cooldown = isinstance(exc, SourceCooldownError)
-                unit.status = (
-                    UnitStatus.FAILED_RETRYABLE
-                    if infrastructure_failure or source_cooldown or unit.attempt_count < 3
-                    else UnitStatus.FAILED_FINAL
-                )
-                attempt.status = "FAILED"
+                if source_cooldown:
+                    # 命中已有共享冷却并未发起新请求时，不消耗单元重试次数；
+                    # 同一来源的真实失败达到三次后才转人工，避免无限冷却循环。
+                    if exc.deferred:
+                        unit.attempt_count = max(0, unit.attempt_count - 1)
+                    unit.status = (
+                        UnitStatus.FAILED_FINAL
+                        if exc.failure_count >= 3
+                        else UnitStatus.FAILED_RETRYABLE
+                    )
+                else:
+                    unit.status = (
+                        UnitStatus.FAILED_RETRYABLE
+                        if infrastructure_failure or unit.attempt_count < 3
+                        else UnitStatus.FAILED_FINAL
+                    )
+                attempt.status = "DEFERRED" if source_cooldown and exc.deferred else "FAILED"
                 attempt.error = str(exc)
                 attempt.ended_at = datetime.now(UTC)
                 apply_resolution(unit)

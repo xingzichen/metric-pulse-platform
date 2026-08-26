@@ -826,10 +826,15 @@ def test_permission_error_pauses_task_without_exhausting_unit_retries(client) ->
     db.close()
 
 
-def test_source_cooldown_never_turns_a_unit_into_final_failure(client) -> None:
+def test_deferred_source_cooldown_does_not_consume_unit_retry(client) -> None:
     class CoolingDownCollector:
         async def collect(self, _record, _unit):
-            raise SourceCooldownError(category="TRANSIENT", retry_after_seconds=240)
+            raise SourceCooldownError(
+                category="TRANSIENT",
+                retry_after_seconds=240,
+                failure_count=2,
+                deferred=True,
+            )
 
     db, _, task, unit = _task_with_unit(
         task_status=TaskStatus.QUEUED,
@@ -844,9 +849,49 @@ def test_source_cooldown_never_turns_a_unit_into_final_failure(client) -> None:
     db.refresh(unit)
     assert task.status == TaskStatus.RUNNING
     assert unit.status == UnitStatus.FAILED_RETRYABLE
-    assert unit.attempt_count == 3
+    assert unit.attempt_count == 2
     assert unit.next_attempt_at is not None
     assert (unit.next_attempt_at - datetime.now(UTC).replace(tzinfo=None)).total_seconds() > 200
+    attempt = db.scalar(
+        select(CollectionAttempt)
+        .where(CollectionAttempt.unit_id == unit.id)
+        .order_by(CollectionAttempt.started_at.desc())
+    )
+    assert attempt is not None and attempt.status == "DEFERRED"
+    db.close()
+
+
+def test_exhausted_shared_source_cooldown_routes_unit_to_manual_review(client) -> None:
+    class ExhaustedCoolingDownCollector:
+        async def collect(self, _record, _unit):
+            raise SourceCooldownError(
+                category="TRANSIENT",
+                retry_after_seconds=3_600,
+                failure_count=3,
+                deferred=True,
+            )
+
+    db, _, task, unit = _task_with_unit(
+        task_status=TaskStatus.QUEUED,
+        unit_status=UnitStatus.FAILED_RETRYABLE,
+    )
+    unit.attempt_count = 1
+    db.commit()
+
+    asyncio.run(TaskProcessor(ExhaustedCoolingDownCollector()).process(db, task.id, max_units=1))
+
+    db.refresh(task)
+    db.refresh(unit)
+    assert task.status == TaskStatus.SUCCEEDED_WITH_ERRORS
+    assert unit.status == UnitStatus.FAILED_FINAL
+    assert unit.attempt_count == 1
+    assert unit.next_attempt_at is None
+    attempt = db.scalar(
+        select(CollectionAttempt)
+        .where(CollectionAttempt.unit_id == unit.id)
+        .order_by(CollectionAttempt.started_at.desc())
+    )
+    assert attempt is not None and attempt.status == "DEFERRED"
     db.close()
 
 

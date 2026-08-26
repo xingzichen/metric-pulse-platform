@@ -144,6 +144,7 @@ class SourceDocument:
     retry_after_seconds: float | None = None
     source_cooldown_until: float | None = None
     source_failure_category: str | None = None
+    source_failure_count: int = 0
     browser_rendered: bool = False
     browser_fallback_reason: str | None = None
     cache_hit: bool = False
@@ -296,12 +297,31 @@ def _active_source_cooldown(cache_key: str, normalized_url: str) -> dict[str, An
         )
         if state and isinstance(state.get("blocked_until"), int | float)
     ]
-    active = [state for state in states if float(state["blocked_until"]) > time.time()]
+    # v1.0.6 及更早版本曾把 SSRF/非 HTTP(S) 安全拒绝误记为 TRANSIENT。
+    # 这类确定性失败应立即进入搜索降级，不得继续命中旧的负缓存。
+    active = [
+        state
+        for state in states
+        if float(state["blocked_until"]) > time.time()
+        and not _is_permanent_source_error(str(state.get("error") or ""))
+    ]
     return max(active, key=lambda state: float(state["blocked_until"])) if active else None
+
+
+def _is_permanent_source_error(error: str) -> bool:
+    return any(
+        marker in error
+        for marker in (
+            "Only public HTTP(S) URLs are allowed",
+            "Private, loopback, and reserved evidence addresses are not allowed",
+        )
+    )
 
 
 def _failure_category(document: SourceDocument) -> str | None:
     error = document.error or ""
+    if _is_permanent_source_error(error):
+        return None
     if document.http_status == 429:
         return "THROTTLED"
     if document.http_status == 403 or looks_like_challenge_page(error):
@@ -351,6 +371,7 @@ def _record_source_failure(
             _write_json_file(host_path, state)
     document.source_cooldown_until = blocked_until
     document.source_failure_category = category
+    document.source_failure_count = failure_count
 
 
 def _clear_source_failure(cache_key: str, normalized_url: str) -> None:
@@ -388,6 +409,7 @@ def _cooldown_document(
         retry_after_seconds=remaining,
         source_cooldown_until=float(state["blocked_until"]),
         source_failure_category=str(state.get("category") or "TRANSIENT"),
+        source_failure_count=int(state.get("failure_count") or 1),
     )
 
 
@@ -1280,6 +1302,7 @@ async def gather_source_documents(
                 _clear_source_failure(cache_key, document.normalized_url or document.url)
                 document.source_cooldown_until = None
                 document.source_failure_category = None
+                document.source_failure_count = 0
                 document.content_hash = (
                     document.content_hash or hashlib.sha256(document.text.encode()).hexdigest()
                 )

@@ -346,6 +346,74 @@ def test_challenge_negative_cache_blocks_repeated_url_and_same_host(monkeypatch,
     assert pipeline._active_source_cooldown(normalized, normalized) is None
 
 
+def test_security_policy_rejection_is_not_negative_cached(monkeypatch, tmp_path) -> None:
+    import asyncio
+
+    import metric_pulse.source_pipeline as pipeline
+
+    pipeline._SOURCE_CACHE.clear()
+    pipeline._SOURCE_CACHE_LOCKS.clear()
+    settings = pipeline.get_settings()
+    monkeypatch.setattr(settings, "source_cache_root", tmp_path)
+    monkeypatch.setattr(settings, "source_host_min_interval_seconds", 0)
+    fetches = 0
+
+    async def fake_fetch(candidate, index, client, validate_url):
+        nonlocal fetches
+        fetches += 1
+        return SourceDocument(
+            index=index,
+            url=candidate.source_url,
+            error="Private, loopback, and reserved evidence addresses are not allowed",
+        )
+
+    async def allow(_url):
+        return None
+
+    monkeypatch.setattr(pipeline, "fetch_source_document", fake_fetch)
+    candidate = SimpleNamespace(
+        source_url="https://example.com/private-redirect",
+        title="Invalid direct source",
+        excerpt=None,
+    )
+
+    first = asyncio.run(
+        gather_source_documents([candidate], allow, browser_fallback_enabled=False)
+    )
+    second = asyncio.run(
+        gather_source_documents([candidate], allow, browser_fallback_enabled=False)
+    )
+
+    assert fetches == 2
+    assert first[0].source_cooldown_until is None
+    assert second[0].source_cooldown_until is None
+    normalized = pipeline.normalize_source_url(candidate.source_url)
+    assert pipeline._active_source_cooldown(normalized, normalized) is None
+
+
+def test_legacy_security_policy_cooldown_is_ignored(monkeypatch, tmp_path) -> None:
+    import time
+
+    import metric_pulse.source_pipeline as pipeline
+
+    monkeypatch.setattr(pipeline.get_settings(), "source_cache_root", tmp_path)
+    normalized = "https://example.com/private-redirect"
+    path = pipeline._source_failure_path(normalized)
+    pipeline._write_json_file(
+        path,
+        {
+            "normalized_url": normalized,
+            "hostname": "example.com",
+            "category": "TRANSIENT",
+            "failure_count": 7,
+            "blocked_until": time.time() + 3_600,
+            "error": "Private, loopback, and reserved evidence addresses are not allowed",
+        },
+    )
+
+    assert pipeline._active_source_cooldown(normalized, normalized) is None
+
+
 def test_dynamic_snapshot_cache_is_reused_within_scope_but_refetched_for_new_scope(
     monkeypatch,
     tmp_path,

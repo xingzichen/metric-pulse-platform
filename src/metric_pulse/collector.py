@@ -81,9 +81,18 @@ class CollectionResult:
 class SourceCooldownError(RuntimeError):
     """权威直链正处于共享冷却，处理器应延后而不是搜索或再次撞站点。"""
 
-    def __init__(self, *, category: str, retry_after_seconds: float) -> None:
+    def __init__(
+        self,
+        *,
+        category: str,
+        retry_after_seconds: float,
+        failure_count: int = 1,
+        deferred: bool = True,
+    ) -> None:
         self.category = category
         self.retry_after_seconds = max(1.0, retry_after_seconds)
+        self.failure_count = max(1, failure_count)
+        self.deferred = deferred
         super().__init__(
             f"source cooldown active: {category}; retry after {self.retry_after_seconds:.0f}s"
         )
@@ -107,6 +116,8 @@ def raise_for_source_cooldown(documents: list[SourceDocument]) -> None:
     raise SourceCooldownError(
         category=document.source_failure_category or "TRANSIENT",
         retry_after_seconds=(document.source_cooldown_until or time.time()) - time.time(),
+        failure_count=document.source_failure_count,
+        deferred=(document.error or "").startswith("source cooldown active:"),
     )
 
 
